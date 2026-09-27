@@ -193,8 +193,8 @@ did this to a private window on 2026-09-26).
 **Cast menu plugin (2026-09-27):** the cast and TV-desktop controls below now also ship as a
 standalone Omarchy plugin, `nathank.raytube` (repo `../omarchy-raytube`, MIT; installed here with
 `omarchy plugin add file://…`). It shows "raytube tools not installed" when `raytube-cast` isn't on
-PATH and "Looking for TVs…" while discovering. The Display-panel clone below still carries the same
-controls on this machine until the author retires it (two cast icons in the bar meanwhile).
+PATH and "Looking for TVs…" while discovering. The Display-panel clone below was **retired on 2026-09-27** (disabled, kept on disk;
+Omarchy's own Display menu is back), so the Cast menu is the only cast icon.
 
 
 CAST section: **Screen | TV desktop** chips (switching mid-cast restarts the
