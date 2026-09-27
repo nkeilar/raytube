@@ -32,7 +32,7 @@ server, database or build of our own beyond those patched programs.
 ## Components
 
 ```
-Display menu (nathank.monitor) ─┐
+Cast menu (nathank.raytube) ───┐
 Hotkeys (bindings.lua) ─────────┼─► raytube-cast ──► cast-tv.sh ──► cast-guard.sh ──► doubletake ─► Office TV
                                 │        │                                    (AirPlay)
                                 │        └──────► cast-chromecast.sh ─► cast-guard.sh ─► omacast ─► Chromecast
@@ -91,9 +91,9 @@ Video source for both TVs: wf-recorder (patched) ─ screencopy DMA-BUF ─► I
 
 ## Desktop integration
 
-- **Display menu:** Omarchy plugin clone `~/.config/omarchy/plugins/nathank.monitor`
-  (CAST: Screen / TV desktop chips, receiver list; for an Apple TV also Sound sync − / +,
-  720p / 1080p / 1440p and Re-sync TV; TV DESKTOP section).
+- **Cast menu:** Omarchy plugin `nathank.raytube` (repo `../omarchy-raytube`; CAST: Screen / TV
+  desktop chips, receivers, Sound sync − / +, 720p / 1080p / 1440p, Re-sync TV, TV sound on/off;
+  TV DESKTOP section). The earlier Display-panel clone `nathank.monitor` is retired (disabled).
 - **Bar:** Omarchy's built-in `omarchy.bar` is the active bar, and it **still shows on
   the TV**. The clone `nathank.bar` (hid the bar on `TV`) is installed but disabled:
   Omarchy gives cloned bars no plugin services, so bar widgets like OmaStats show

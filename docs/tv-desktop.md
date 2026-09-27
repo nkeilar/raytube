@@ -188,21 +188,25 @@ notification.
 is under the pointer. Focus the target window explicitly before each call (a test
 did this to a private window on 2026-09-26).
 
-## Display menu (nathank.monitor)
+## Cast menu (nathank.raytube)
 
-**Cast menu plugin (2026-09-27):** the cast and TV-desktop controls below now also ship as a
-standalone Omarchy plugin, `nathank.raytube` (repo `../omarchy-raytube`, MIT; installed here with
-`omarchy plugin add file://…`). It shows "raytube tools not installed" when `raytube-cast` isn't on
-PATH and "Looking for TVs…" while discovering. The Display-panel clone below was **retired on 2026-09-27** (disabled, kept on disk;
-Omarchy's own Display menu is back), so the Cast menu is the only cast icon.
+The cast controls live in the **Cast menu**, a standalone Omarchy bar-widget plugin
+`nathank.raytube` (repo `../omarchy-raytube`, MIT; installed here with
+`omarchy plugin add file://…`; after changing it, fully restart the shell). It sits in the bar's
+right section after the tray arrow and calls `raytube-cast` / `raytube-tv` on PATH.
 
+- Header: "Raytube" with NOT CASTING / CASTING TO …; "raytube tools not installed" when
+  `raytube-cast` is missing; "Looking for TVs…" while discovering.
+- **CAST:** **Screen | TV desktop** chips (switching mid-cast restarts the cast in the new mode),
+  the receiver list with casting state. While casting to an Apple TV: **Sound sync − / +** (live,
+  50 ms steps), **720p | 1080p | 1440p** (picture size, restarts the cast), **Re-sync TV**. While
+  casting to either TV: **TV sound: on / off (laptop only)** (`raytube-cast tv-sound`).
+- **TV DESKTOP** (only while `TV` exists): Full / Split / PiP / rotation, Board / Browser /
+  YouTube ⇄ TV app, scene rows (click to show, ↻ toggles rotation).
 
-CAST section: **Screen | TV desktop** chips (switching mid-cast restarts the
-cast in the new mode), receiver list with casting state. TV DESKTOP section
-(only while `TV` exists): Full / Split / PiP / rotation, Board / Browser /
-YouTube ⇄ TV app buttons, scene rows (click to show, ↻ toggles rotation). While casting to an
-Apple TV the CAST section also shows **Sound sync − / +** (live, 50 ms steps), **720p | 1080p |
-1440p** (picture size, restarts the cast) and **Re-sync TV**.
+History: until 2026-09-27 these controls lived in `nathank.monitor`, a clone of Omarchy's Display
+panel. That clone replaced the user's Display menu and relied on clone-only access, so it was
+retired (disabled, kept on disk) and `omarchy.monitor` re-enabled in the same bar slot.
 
 ## Related docs
 
