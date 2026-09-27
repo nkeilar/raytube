@@ -32,6 +32,7 @@ raytube-cast size <apple-tv-ip> 1080p   # picture size for an Apple TV: 720p|108
 raytube-cast av-delay <apple-tv-ip> 50  # sound delay in ms for an Apple TV (applied live)
 raytube-cast av-delay-step -50          # nudge the current TV's sound earlier/later (Display menu − / +)
 raytube-cast resync                     # restart the session: back in sync (Display menu Re-sync TV, TV mode A)
+raytube-cast tv-sound [on|off|toggle]   # mute only what the TV receives (Cast menu: TV sound on/off)
 raytube-tv json                         # TV desktop state
 raytube-tv browser "<url>"              # TV browser in the Watch scene
 raytube-tv board                        # family board

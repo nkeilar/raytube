@@ -16,6 +16,8 @@
 #                                (both modes; default 1080p; restarts a running cast)
 #   raytube-cast av-delay <ip> [ms]   show or set an Apple TV's sound delay (live)
 #   raytube-cast av-delay-step <+/-ms> nudge the current TV's sound delay (live)
+#   raytube-cast tv-sound [on|off|toggle]   mute or unmute only what the TV
+#                                receives (the laptop and headphones are unaffected)
 #
 # AirPlay receivers use cast-tv.sh (doubletake); Chromecasts use
 # cast-chromecast.sh (omacast, Cast Streaming). Either runs in the background
@@ -211,6 +213,30 @@ cmd_av_delay_step() {
 		"← sound earlier   → sound later   Enter/Esc done"
 }
 
+# tv-sound: mute the cast's audio capture, so the TV goes quiet while the laptop
+# (or headphones) keep playing. Prints "on" or "off".
+cast_capture() { # source-output index of the cast's audio capture (doubletake or omacast)
+	pactl -f json list source-outputs 2>/dev/null | python3 -c '
+import json, sys
+for s in json.load(sys.stdin):
+    p = s["properties"]
+    if p.get("application.name") in ("gst-launch-1.0", "omacastd") or p.get("application.process.binary") == "omacastd":
+        print(s["index"], "yes" if s.get("mute") else "no"); break'
+}
+cmd_tv_sound() {
+	local want=${1:-} idx muted
+	read -r idx muted <<< "$(cast_capture)"
+	[ -n "$idx" ] || { echo "off (not casting)"; return 1; }
+	case "$want" in
+		"") [ "$muted" = yes ] && echo off || echo on; return ;;
+		toggle) [ "$muted" = yes ] && want=on || want=off ;;
+	esac
+	pactl set-source-output-mute "$idx" "$([ "$want" = off ] && echo 1 || echo 0)"
+	notify-send -t 2000 -h string:x-canonical-private-synchronous:raytube-sound "TV sound $want" \
+		"$([ "$want" = off ] && echo "The TV is quiet; the laptop still plays." || echo "The TV plays sound again.")"
+	echo "$want"
+}
+
 # resync: restart the current cast session. A fresh session always starts with
 # sound and picture in sync; the Apple TV never catches up by itself after a
 # glitch (doubletake can't FLUSH), so this is the recovery.
@@ -224,6 +250,7 @@ cmd_resync() {
 
 case "${1:-}" in
 	resync) cmd_resync ;;
+	tv-sound) cmd_tv_sound "${2:-}" ;;
 	av-delay) cmd_av_delay "${2:?ip}" "${3:-}" ;;
 	size) cmd_size "${2:?ip}" "${3:-}" ;;
 	av-delay-step) cmd_av_delay_step "${2:?+/-ms}" ;;

@@ -91,6 +91,10 @@ airplay-esp32) isn't implemented in doubletake, but a fresh session always start
 things are calm for 10 s after a glitch burst or audio restart (at most every 5 min); also the
 Display menu **Re-sync TV** button and TV mode **A**. Cast units run with `CPUWeight=1000` so the
 audio path wins CPU contention (glitches at 00:07 on 09-27 coincided with load 9 from MCP servers).
+**Headphones and TV sound (2026-09-27):** connecting AirPods moved the TV-desktop cast's audio
+capture (targeted at `raytube_tv.monitor`) onto the AirPods' monitor, so the TV played everything the
+AirPods did. `cast-watch.sh` now moves it back within 5 s in desktop mode (tested). `raytube-cast
+tv-sound off` mutes just the capture stream, so the TV goes quiet while the laptop keeps playing.
 `cast-watch.sh` (unit `raytube-watch`) logs every such event to
 `~/.local/state/raytube/cast-watch.log` with CPU temperature, Hyprland CPU, load, the top
 processes and the default sink at that moment.

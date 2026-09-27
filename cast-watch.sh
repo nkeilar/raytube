@@ -5,6 +5,9 @@
 #  * Every 5 s reads PipeWire's xrun counter for the cast's audio capture
 #    (gst-launch pulsesrc). More than 2 new glitches in 30 s: raise the audio
 #    cycle 1024 -> 2048 samples and notify.
+#  * In TV-desktop mode, keeps the cast's audio capture on the TV output
+#    (raytube_tv.monitor): connecting Bluetooth headphones moved it to their
+#    output once, so the TV played everything the headphones did.
 #  * After a glitch burst or an audio-only capture restart, the Apple TV stays
 #    out of sync (it never catches up by itself), so once things have been calm
 #    for 10 s, re-sync (restart the cast session) - at most every 5 minutes.
@@ -42,6 +45,21 @@ while sleep 5; do
 	window=("${window[@]: -5}" "$new")   # last 30 s
 	total=0; for n in "${window[@]}"; do total=$(( total + n )); done
 	if (( new > 0 )); then echo "$(date +%T) audio glitch x$new (30 s: $total) | $(context)" >> "$LOG"; fi
+	# Keep the capture on the TV output in TV-desktop mode.
+	if [ "$(cat "$HOME/.local/state/raytube/mode" 2>/dev/null)" = desktop ]; then
+		read -r cap_idx cap_src <<< "$(pactl -f json list source-outputs 2>/dev/null | python3 -c '
+import json, sys, subprocess
+names = {}
+for l in subprocess.run(["pactl", "list", "short", "sources"], capture_output=True, text=True).stdout.splitlines():
+    f = l.split("\t"); names[int(f[0])] = f[1]
+for s in json.load(sys.stdin):
+    if s["properties"].get("application.name") in ("gst-launch-1.0", "omacastd"):
+        print(s["index"], names.get(s["source"], "?")); break')"
+		if [ -n "${cap_idx:-}" ] && [ "$cap_src" != raytube_tv.monitor ]; then
+			pactl move-source-output "$cap_idx" raytube_tv.monitor 2>/dev/null &&
+				echo "$(date +%T) cast audio was capturing $cap_src; moved back to the TV output" >> "$LOG"
+		fi
+	fi
 	# A stuck-audio restart inside doubletake also leaves the TV out of sync.
 	if journalctl --user -u raytube-cast --since "@$checked" --no-pager -o cat 2>/dev/null | grep -q "restarting audio capture only"; then
 		resync_pending=1
