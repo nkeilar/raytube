@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cast Latency Test</title>
+<style>
+  :root {
+    --bg: #0b0d10; --fg: #e8eaed; --muted: #8a9099; --accent: #4cc2ff;
+    --good: #5bd48a; --warn: #ffb454; --flash: #ffffff; --panel: #151920;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) { --bg: #0b0d10; }
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 18px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { display: grid; place-items: center; }
+  #flash { position: fixed; inset: 0; background: var(--flash); display: none; z-index: 10; }
+  main { width: min(760px, calc(100% - 32px)); text-align: center; }
+  h1 { font-size: 2.4rem; margin: 0 0 .25rem; letter-spacing: -.02em; }
+  .sub { color: var(--muted); margin: 0 0 2rem; }
+  .phase { font-size: 1.6rem; font-weight: 650; margin: 1.5rem 0 .5rem; }
+  .instr { font-size: 1.25rem; color: var(--fg); min-height: 3.5em; }
+  .count { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .big { font-size: 5rem; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--accent); margin: .5rem 0; }
+  table { margin: 1.5rem auto 0; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td, th { padding: .35rem 1rem; border-bottom: 1px solid #262b33; text-align: right; }
+  th { color: var(--muted); font-weight: 500; }
+  td:first-child, th:first-child { text-align: left; }
+  .panel { background: var(--panel); border-radius: 12px; padding: 1.25rem 1.5rem; margin-top: 1.5rem; }
+  kbd { background: #262b33; border-radius: 6px; padding: .1em .5em; font-family: inherit; }
+  .trials { color: var(--muted); font-size: .95rem; margin-top: 1rem; word-break: break-word; }
+</style>
+</head>
+<body>
+<div id="flash"></div>
+<main>
+  <h1>Cast latency test</h1>
+  <p class="sub">Measures the delay from this laptop's screen to the TV, minus your own reaction time.</p>
+  <div class="phase" id="phase">Ready</div>
+  <div class="instr" id="instr">Press <kbd>Space</kbd> to start calibration.<br>Look at the <b>laptop</b> screen.</div>
+  <div class="count" id="count"></div>
+  <div id="result"></div>
+</main>
+<script>
+const TRIALS = 8;             // counted trials per phase
+const MIN_GAP = 4000, MAX_GAP = 7000;  // ms between flashes (> expected delay)
+const FLASH_MS = 1200;        // flash duration on screen
+const MIN_RT = 120;           // faster presses are anticipation, discarded
+
+const $ = id => document.getElementById(id);
+const flash = $("flash");
+let state = "idle";           // idle | laptop | tv | done
+let onset = null;             // performance.now() when the current flash was painted
+let answered = true;
+let timer = null;
+const results = { laptop: [], tv: [] };
+
+function median(a) { const s = [...a].sort((x, y) => x - y); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
+
+function schedule() {
+  clearTimeout(timer);
+  const gap = MIN_GAP + Math.random() * (MAX_GAP - MIN_GAP);
+  timer = setTimeout(showFlash, gap);
+}
+
+function showFlash() {
+  flash.style.display = "block";
+  // onset = the frame on which the flash is actually presented
+  requestAnimationFrame(t => { onset = t; answered = false; });
+  setTimeout(() => { flash.style.display = "none"; }, FLASH_MS);
+  schedule();
+}
+
+function updateCount() {
+  const n = results[state]?.length ?? 0;
+  $("count").textContent = state === "laptop" || state === "tv" ? `${n} / ${TRIALS} flashes answered` : "";
+}
+
+function startPhase(p) {
+  state = p;
+  if (p === "laptop") {
+    $("phase").textContent = "1. Calibration";
+    $("instr").innerHTML = "Look at the <b>laptop</b> screen.<br>Press <kbd>Space</kbd> the moment it flashes white.";
+  } else {
+    $("phase").textContent = "2. Measurement";
+    $("instr").innerHTML = "Look only at the <b>TV</b> (cover or turn away from the laptop).<br>Press <kbd>Space</kbd> the moment the TV flashes white.";
+  }
+  updateCount();
+  schedule();
+}
+
+function finish() {
+  clearTimeout(timer); state = "done"; flash.style.display = "none";
+  const rl = median(results.laptop), rt = median(results.tv);
+  const delay = rt - rl;
+  $("phase").textContent = "Result";
+  $("instr").innerHTML = "Estimated cast delay (TV minus laptop, medians):";
+  $("count").textContent = "";
+  $("result").innerHTML = `
+    <div class="big">${Math.round(delay)} ms</div>
+    <div class="panel"><table>
+      <tr><th></th><th>median</th><th>min</th><th>max</th></tr>
+      <tr><td>Laptop (your reaction)</td><td>${Math.round(rl)} ms</td><td>${Math.round(Math.min(...results.laptop))}</td><td>${Math.round(Math.max(...results.laptop))}</td></tr>
+      <tr><td>TV (reaction + cast)</td><td>${Math.round(rt)} ms</td><td>${Math.round(Math.min(...results.tv))}</td><td>${Math.round(Math.max(...results.tv))}</td></tr>
+    </table>
+    <div class="trials">laptop: ${results.laptop.map(Math.round).join(", ")}<br>tv: ${results.tv.map(Math.round).join(", ")}</div></div>
+    <p class="sub" style="margin-top:1.5rem">Press <kbd>R</kbd> to run again.</p>`;
+  document.title = `Cast latency ${Math.round(delay)} ms`;
+}
+
+document.addEventListener("keydown", e => {
+  if (e.code === "KeyR" && state === "done") { location.reload(); return; }
+  if (e.code !== "Space") return;
+  e.preventDefault();
+  if (state === "idle") { startPhase("laptop"); return; }
+  if (state === "done") return;
+  if (answered || onset === null) return;          // press with no pending flash
+  const rt = e.timeStamp - onset;
+  if (rt < MIN_RT) return;                          // anticipation
+  answered = true;
+  results[state].push(rt);
+  updateCount();
+  if (results[state].length >= TRIALS) {
+    clearTimeout(timer);
+    if (state === "laptop") {
+      state = "between";
+      $("phase").textContent = "Calibration done";
+      $("instr").innerHTML = `Your reaction: <b>${Math.round(median(results.laptop))} ms</b>.<br>Now look at the <b>TV</b> and press <kbd>Space</kbd> to begin.`;
+      $("count").textContent = "";
+    } else finish();
+  }
+});
+// between phases: next Space starts the TV phase
+document.addEventListener("keydown", e => {
+  if (e.code === "Space" && state === "between") { e.stopImmediatePropagation(); setTimeout(() => startPhase("tv"), 0); }
+}, true);
+</script>
+</body>
+</html>

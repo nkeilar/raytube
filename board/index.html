@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Family Board</title>
+<style>
+  /* Drawn for a 1920x1080 TV; everything scales with the viewport. */
+  :root {
+    color-scheme: dark;
+    --ink: #0a0b12; --text: #ece9e2; --muted: #9aa0b6; --faint: #6a7089; --glow: #ffc978;
+    --display: "Bricolage Grotesque", "Avenir Next", "Noto Sans", system-ui, sans-serif;
+    --body: "IBM Plex Sans", "Noto Sans", system-ui, sans-serif;
+    --mono: "JetBrains Mono", "JetBrainsMono Nerd Font", ui-monospace, monospace;
+  }
+  html, body { margin: 0; height: 100%; background: var(--ink); color: var(--text); overflow: hidden; cursor: none; }
+  body { font: 1vw/1.35 var(--body); }
+  #bg { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  .board { position: fixed; inset: 0; display: grid; grid-template-rows: auto 1fr; padding: 2.6vh 2.6vw 3.4vh; gap: 2.4vh; }
+  .head { display: flex; align-items: flex-end; justify-content: space-between; gap: 2vw; }
+  .clock { font: 800 7.2vw/0.9 var(--display); letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+  .date { font: 600 1.9vw/1.2 var(--display); color: #d9d6ce; margin-top: 0.6vh; }
+  .wx { text-align: right; font: 600 1.7vw/1.3 var(--display); color: #cfd3e6; }
+  .wx small { display: block; font: 400 1.1vw var(--body); color: var(--muted); }
+  .main { display: grid; grid-template-columns: 1fr 27vw; gap: 1.6vw; min-height: 0; }
+  .cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.2vw; min-height: 0; }
+  .col { --c: #6fb3e8; background: rgba(16, 18, 28, 0.62); border: 1px solid rgba(255,255,255,0.06); border-top: 0.55vh solid var(--c); border-radius: 1vw; padding: 1.6vw; display: flex; flex-direction: column; gap: 1.4vh; min-height: 0; overflow: hidden; }
+  .who { display: flex; align-items: center; gap: 0.9vw; margin-bottom: 0.6vh; }
+  .av { width: 3.6vw; height: 3.6vw; border-radius: 50%; background: var(--c); color: #11131b; display: grid; place-items: center; font: 800 1.7vw var(--display); flex: none; }
+  .who b { font: 800 2.2vw/1 var(--display); display: block; }
+  .who span { color: var(--muted); font-size: 1.1vw; }
+  .ttl { font: 600 0.85vw var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: #8b91a8; margin-top: 0.8vh; }
+  .item { display: grid; grid-template-columns: 4.4vw 1fr; gap: 0.5vw; font-size: 1.2vw; line-height: 1.3; }
+  .item time { color: var(--c); font: 400 1.15vw/1.55 var(--mono); font-variant-numeric: tabular-nums; }
+  .item.past { opacity: 0.45; }
+  .todo { display: flex; gap: 0.7vw; align-items: center; font-size: 1.35vw; }
+  .box { width: 1.3vw; height: 1.3vw; border-radius: 0.3vw; border: 0.2vw solid var(--c); flex: none; }
+  .todo.done .box { background: var(--c); }
+  .todo.done span { color: #7f859c; text-decoration: line-through; }
+  .col.big .todo { font: 800 2.1vw/1.25 var(--display); }
+  .col.big .box { width: 2.2vw; height: 2.2vw; border-radius: 0.5vw; }
+  .big { font: 800 1.7vw/1.25 var(--display); }
+  .stars { display: flex; gap: 0.4vw; }
+  .stars svg { width: 2.6vw; height: 2.6vw; }
+
+  /* Calendar panel: where we are in the week, the month, what's coming up. */
+  .cal { background: rgba(16, 18, 28, 0.62); border: 1px solid rgba(255,255,255,0.06); border-top: 0.55vh solid var(--glow); border-radius: 1vw; padding: 1.3vw 1.5vw; display: flex; flex-direction: column; gap: 1vh; min-height: 0; overflow: hidden; }
+  .cal-today { font: 800 1.9vw/1.1 var(--display); }
+  .cal-today small { display: block; font: 400 1vw/1.4 var(--body); color: var(--muted); }
+  .week { display: grid; grid-template-columns: repeat(7, 1fr); gap: 0.35vw; }
+  .week div { text-align: center; font: 700 0.95vw/2 var(--display); border-radius: 0.4vw; background: rgba(255,255,255,0.06); color: var(--faint); }
+  .week div.gone { background: rgba(255, 201, 120, 0.22); color: #d9c7a4; }
+  .week div.now { background: var(--glow); color: #11131b; }
+  .month-name { font: 600 0.85vw var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: #8b91a8; margin-top: 0.4vh; }
+  .month { display: grid; grid-template-columns: repeat(7, 1fr); row-gap: 0.25vh; font-variant-numeric: tabular-nums; }
+  .month .dow { text-align: center; font: 600 0.8vw/1.8 var(--mono); color: var(--faint); }
+  .month .dow.now { color: var(--glow); }
+  .month .d { position: relative; text-align: center; font: 500 1.05vw/1.85 var(--body); color: #cfd3e6; }
+  .month .d.out { visibility: hidden; }
+  .month .d.past { color: #5d6279; }
+  .month .d.wk { background: rgba(255, 201, 120, 0.08); }
+  .month .d.wk.first { border-radius: 0.5vw 0 0 0.5vw; }
+  .month .d.wk.last { border-radius: 0 0.5vw 0.5vw 0; }
+  .month .d.today span { display: inline-grid; place-items: center; width: 1.85vw; height: 1.85vw; border-radius: 50%; background: var(--glow); color: #11131b; font-weight: 800; }
+  .month .dots { position: absolute; left: 0; right: 0; bottom: 0.1vh; display: flex; justify-content: center; gap: 0.15vw; }
+  .month .dots i { width: 0.36vw; height: 0.36vw; border-radius: 50%; }
+  .up { display: flex; flex-direction: column; gap: 0.5vh; min-height: 0; overflow: hidden; }
+  .up h4 { margin: 0.6vh 0 0; font: 700 1vw var(--display); color: #d9d6ce; }
+  .up h4.today { color: var(--glow); }
+  .ev { display: grid; grid-template-columns: 0.7vw 3.9vw 1fr; gap: 0.5vw; align-items: baseline; font-size: 1.1vw; line-height: 1.3; }
+  .ev i { width: 0.7vw; height: 0.7vw; border-radius: 50%; align-self: center; }
+  .ev time { color: var(--muted); font: 400 1vw var(--mono); font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<canvas id="bg" aria-hidden="true"></canvas>
+<div class="board">
+  <div class="head">
+    <div><div class="clock" id="clock"></div><div class="date" id="date"></div></div>
+    <div class="wx" id="wx"></div>
+  </div>
+  <div class="main">
+    <div class="cols" id="cols"></div>
+    <div class="cal" id="cal"></div>
+  </div>
+</div>
+
+<script src="vendor/three.min.js"></script>
+<script>
+  const STAR = '<svg viewBox="0 0 24 24"><path fill="#ffcf5c" d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17l-6.1 3.4 1.5-6.8L2.2 9l6.9-.7z"/></svg>';
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function nowMinutes() { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); }
+  function toMinutes(hhmm) { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; }
+  function fmt(hhmm) {
+    const [h, m] = hhmm.split(":").map(Number);
+    return (h % 12 || 12) + ":" + String(m).padStart(2, "0");
+  }
+
+  function render() {
+    const d = window.BOARD_DATA;
+    if (!d) return;
+    document.getElementById("wx").innerHTML = esc(d.weather.now) + "<small>" + esc(d.weather.note) + "</small>";
+    const now = nowMinutes();
+    document.getElementById("cols").innerHTML = d.people.map(p => {
+      let h = `<div class="col${p.big ? " big" : ""}" style="--c:${esc(p.color)}">`;
+      h += `<div class="who"><div class="av">${esc(p.name[0])}</div><div><b>${esc(p.name)}</b><span>${esc(p.role)}</span></div></div>`;
+      if (p.events && p.events.length) {
+        h += `<div class="ttl">Today</div>`;
+        h += p.events.map(([t, what]) => `<div class="item${toMinutes(t) + 60 < now ? " past" : ""}"><time>${fmt(t)}</time><span>${esc(what)}</span></div>`).join("");
+      }
+      if (p.streak) h += `<div class="ttl">${esc(p.streak.label)}</div><div class="big">${esc(p.streak.value)}</div>`;
+      if (p.todos && p.todos.length) {
+        h += `<div class="ttl">${esc(p.todoTitle || "To do")}</div>`;
+        h += p.todos.map(([what, done]) => `<div class="todo${done ? " done" : ""}"><span class="box"></span><span>${esc(what)}</span></div>`).join("");
+      }
+      if (p.stars) h += `<div class="ttl">Stars this week</div><div class="stars">${STAR.repeat(p.stars)}</div>`;
+      return h + "</div>";
+    }).join("");
+  }
+
+  // ---------- calendar ----------
+  // Weeks start on Monday. Events use "day" as days from today (so mock data
+  // always looks current) or a real "date": "YYYY-MM-DD".
+  const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const dayIndex = dt => (dt.getDay() + 6) % 7;            // Mon = 0 ... Sun = 6
+  const ymd = dt => dt.getFullYear() + "-" + String(dt.getMonth() + 1).padStart(2, "0") + "-" + String(dt.getDate()).padStart(2, "0");
+  function startOfDay(dt) { return new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()); }
+  function eventDate(e, today) {
+    if (e.date) { const [y, m, d] = e.date.split("-").map(Number); return new Date(y, m - 1, d); }
+    return new Date(today.getFullYear(), today.getMonth(), today.getDate() + (e.day || 0));
+  }
+
+  function renderCalendar() {
+    const d = window.BOARD_DATA;
+    if (!d || !d.calendar) return;
+    const now = new Date(), today = startOfDay(now), ti = dayIndex(today);
+    const colorOf = Object.fromEntries(d.people.map(p => [p.id, p.color]));
+    colorOf.family = "#ffc978";
+    const events = d.calendar.events.map(e => ({ ...e, at: eventDate(e, today) }))
+      .sort((a, b) => a.at - b.at || (a.time || "").localeCompare(b.time || ""));
+    const byDay = {};
+    for (const e of events) (byDay[ymd(e.at)] = byDay[ymd(e.at)] || []).push(e);
+
+    // Where we are in the week.
+    let h = `<div class="cal-today">${esc(today.toLocaleDateString([], { weekday: "long" }))}` +
+      `<small>Day ${ti + 1} of 7 this week</small></div>`;
+    h += `<div class="week">` + DAYS.map((n, i) =>
+      `<div class="${i < ti ? "gone" : i === ti ? "now" : ""}">${n[0]}</div>`).join("") + `</div>`;
+
+    // The month, Monday first; today circled, this week shaded, dots per person.
+    const first = new Date(today.getFullYear(), today.getMonth(), 1);
+    const daysIn = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
+    const lead = dayIndex(first);
+    const weekStart = new Date(today.getFullYear(), today.getMonth(), today.getDate() - ti);
+    const weekEnd = new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 6);
+    h += `<div class="month-name">${esc(today.toLocaleDateString([], { month: "long", year: "numeric" }))}</div><div class="month">`;
+    h += DAYS.map((n, i) => `<div class="dow${i === ti ? " now" : ""}">${n[0]}</div>`).join("");
+    const cells = Math.ceil((lead + daysIn) / 7) * 7;
+    for (let c = 0; c < cells; c++) {
+      const n = c - lead + 1;
+      if (n < 1 || n > daysIn) { h += `<div class="d out">.</div>`; continue; }
+      const dt = new Date(today.getFullYear(), today.getMonth(), n);
+      const cls = ["d"];
+      if (dt < today) cls.push("past");
+      if (dt >= weekStart && dt <= weekEnd) { cls.push("wk"); if (c % 7 === 0) cls.push("first"); if (c % 7 === 6) cls.push("last"); }
+      if (+dt === +today) cls.push("today");
+      const who = [...new Set((byDay[ymd(dt)] || []).map(e => e.who))].slice(0, 4);
+      const dots = who.length ? `<div class="dots">${who.map(w => `<i style="background:${esc(colorOf[w] || "#ccc")}"></i>`).join("")}</div>` : "";
+      h += `<div class="${cls.join(" ")}"><span>${n}</span>${dots}</div>`;
+    }
+    h += `</div>`;
+
+    // Coming up: today and the next days that have something on.
+    // As many days as fit: about six events, always today and at least the next day.
+    const upcoming = [];
+    let shown = 0;
+    for (const k of Object.keys(byDay).filter(k => k >= ymd(today)).sort()) {
+      if (upcoming.length >= 2 && shown + byDay[k].length > 6) break;
+      upcoming.push(k); shown += byDay[k].length;
+    }
+    h += `<div class="up">`;
+    for (const k of upcoming) {
+      const dt = byDay[k][0].at, diff = Math.round((dt - today) / 86400000);
+      const label = diff === 0 ? "Today" : diff === 1 ? "Tomorrow" : dt.toLocaleDateString([], { weekday: "long", day: "numeric" });
+      h += `<h4 class="${diff === 0 ? "today" : ""}">${esc(label)}</h4>`;
+      h += byDay[k].map(e => `<div class="ev"><i style="background:${esc(colorOf[e.who] || "#ccc")}"></i>` +
+        `<time>${e.time ? fmt(e.time) : ""}</time><span>${esc(e.title)}</span></div>`).join("");
+    }
+    h += `</div>`;
+    document.getElementById("cal").innerHTML = h;
+  }
+
+  function tick() {
+    const n = new Date();
+    document.getElementById("clock").textContent = n.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).replace(/\s?[AP]M/i, "");
+    document.getElementById("date").textContent = n.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
+  }
+
+  // Reload data.js every minute so edits appear without restarting the board.
+  function reloadData() {
+    const s = document.createElement("script");
+    // Your own data.js (kept out of git); the example ships with raytube.
+    s.src = (window.BOARD_DATA_EXAMPLE ? "data.example.js" : "data.js") + "?t=" + Date.now();
+    s.onload = () => { render(); renderCalendar(); s.remove(); };
+    s.onerror = () => { s.remove(); if (!window.BOARD_DATA_EXAMPLE) { window.BOARD_DATA_EXAMPLE = true; reloadData(); } };
+    document.head.appendChild(s);
+  }
+
+  tick(); reloadData();
+  setInterval(tick, 5000);
+  setInterval(reloadData, 60000);
+
+  // Background: slow drifting light in the four family colours. Capped at
+  // 30 fps at device pixel ratio 1; the compositor stops frame callbacks when
+  // this scene is not on screen, so it costs nothing while hidden.
+  (function () {
+    const canvas = document.getElementById("bg");
+    if (!window.THREE) return;
+    let renderer;
+    try { renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: "low-power" }); } catch (e) { return; }
+    renderer.setPixelRatio(1);
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color("#0a0b12");
+    const camera = new THREE.PerspectiveCamera(50, 16 / 9, 0.1, 100);
+    camera.position.z = 14;
+    const colors = ["#6fb3e8", "#ef93b8", "#7fd69a", "#ffcf5c"].map(h => new THREE.Color(h));
+    const N = 1200, pos = new Float32Array(N * 3), col = new Float32Array(N * 3), seed = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const band = i % 4;
+      pos[i * 3] = (band - 1.5) * 5.2 + (Math.random() - 0.5) * 4.5;
+      pos[i * 3 + 1] = (Math.random() - 0.5) * 10;
+      pos[i * 3 + 2] = (Math.random() - 0.5) * 8;
+      const c = colors[band];
+      col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
+      seed[i] = Math.random() * 6.28;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    // Soft round sprite so points read as glowing dots, not squares.
+    const dot = document.createElement("canvas"); dot.width = dot.height = 64;
+    const g = dot.getContext("2d"), grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, "rgba(255,255,255,1)"); grad.addColorStop(0.35, "rgba(255,255,255,0.55)"); grad.addColorStop(1, "rgba(255,255,255,0)");
+    g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+    const pts = new THREE.Points(geo, new THREE.PointsMaterial({ size: 0.34, map: new THREE.CanvasTexture(dot), vertexColors: true, transparent: true, opacity: 0.6, depthWrite: false, blending: THREE.AdditiveBlending }));
+    scene.add(pts);
+    function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+    resize(); addEventListener("resize", resize);
+    let last = 0;
+    function frame(t) {
+      requestAnimationFrame(frame);
+      if (t - last < 33) return;
+      last = t;
+      const p = geo.attributes.position.array, s = t * 0.00012;
+      for (let i = 0; i < N; i++) p[i * 3 + 1] += Math.sin(s * 3 + seed[i]) * 0.004;
+      geo.attributes.position.needsUpdate = true;
+      pts.rotation.y = Math.sin(s) * 0.25;
+      pts.rotation.x = Math.cos(s * 0.7) * 0.08;
+      renderer.render(scene, camera);
+    }
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) renderer.render(scene, camera);
+    else requestAnimationFrame(frame);
+  })();
+</script>
+</body>
+</html>

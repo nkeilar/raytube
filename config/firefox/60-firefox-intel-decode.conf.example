@@ -1,0 +1,4 @@
+# ~/.config/environment.d/60-firefox-intel-decode.conf
+# Pin Firefox's VA-API decoding to the Intel GPU on dual-GPU machines. Replace
+# the node with the one scripts/detect-gpu.sh reports (RAYTUBE_RENDER_NODE).
+MOZ_DRM_DEVICE=/dev/dri/renderD128

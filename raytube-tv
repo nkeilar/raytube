@@ -1,0 +1,804 @@
+#!/usr/bin/env python3
+"""raytube-tv -- the virtual TV desktop: a headless Hyprland monitor that gets
+cast instead of the laptop screen, split into scenes you flip between.
+
+  raytube-tv up [WxH]          create the TV monitor (default 1920x1080), its
+                               first scene and the TV audio output; idempotent
+  raytube-tv down              bring windows home; remove monitor and audio output
+  raytube-tv send              move the focused window to the TV (or back home);
+                               its audio follows
+  raytube-tv back              bring the most recently sent window home (again
+                               for the one before); needs no focus on the TV
+  raytube-tv to-tv             send the focused window to the TV (one way)
+  raytube-tv home              bring the focused window home if it is on the TV,
+                               else the most recently sent one
+  raytube-tv video-full        make the TV browser the one full-screen window
+  raytube-tv tv-mode           enter "TV mode": one key per action (see KEYS)
+  raytube-tv key <letter>      run a TV-mode key and leave TV mode
+  raytube-tv status            "up WxH" or "down"
+  raytube-tv json              full state for the Display menu
+
+Scenes are workspaces on the TV monitor, named tv-<id>, listed with their
+rotation settings in ~/.config/raytube/tv.json. Arrange windows in a scene with
+normal Omarchy tiling, or apply a preset:
+
+  raytube-tv scene <id>        show a scene on the TV
+  raytube-tv next | prev       step through scenes that have windows
+  raytube-tv layout full|split|pip|next
+                               arrange the current scene: main window only,
+                               side by side, or main with a corner inset
+  raytube-tv swap              swap the main window with the inset / other side
+  raytube-tv rotate on|off|toggle
+                               cycle through the scenes marked for rotation
+  raytube-tv rotate-scene <id> on|off   include or exclude a scene
+  raytube-tv board             open the family board in the "board" scene
+  raytube-tv browser [url]     open the TV browser (a separate Firefox) in the
+                               "watch" scene, optionally at <url>
+  raytube-tv native            toggle the video between the TV desktop and the
+                               Chromecast's own YouTube app (same position)
+  raytube-tv pull              bring whatever the Chromecast's YouTube app is
+                               playing onto the TV desktop, at the same position
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+OUT = "TV"
+SINK = "raytube_tv"
+# The screen windows come home to: RAYTUBE_LAPTOP_OUTPUT, else the first
+# monitor that isn't the TV (the built-in panel on a laptop).
+LAPTOP = os.environ.get("RAYTUBE_LAPTOP_OUTPUT", "")
+CONFIG = os.path.expanduser("~/.config/raytube/tv.json")
+STATE = os.path.expanduser("~/.local/state/raytube/tv-state.json")
+ROTATION_UNIT = "raytube-rotation"
+LAYOUTS = ["full", "split", "pip"]
+SIZE_FILE = os.path.expanduser("~/.local/state/raytube/tv-size")
+
+DEFAULT_CONFIG = {
+    "scenes": [
+        {"id": "main", "label": "Main", "rotate": True, "seconds": 120, "layout": "full"},
+        {"id": "board", "label": "Family board", "rotate": True, "seconds": 120, "layout": "full"},
+        {"id": "watch", "label": "Watch", "rotate": True, "seconds": 300, "layout": "pip"},
+    ]
+}
+
+
+# ---------- Hyprland / PipeWire helpers ----------
+
+def hyprctl_json(what):
+    return json.loads(subprocess.run(["hyprctl", "-j", what], capture_output=True, text=True).stdout or "[]")
+
+
+def dispatch(code):
+    subprocess.run(["hyprctl", "-q", "eval", f"hl.dispatch({code})"])
+
+
+def lua(code):
+    subprocess.run(["hyprctl", "-q", "eval", code])
+
+
+def tv_monitor():
+    return next((m for m in hyprctl_json("monitors") if m["name"] == OUT), None)
+
+
+def laptop_monitor():
+    mons = [m for m in hyprctl_json("monitors") if m["name"] != OUT]
+    named = next((m for m in mons if m["name"] == LAPTOP), None)
+    return named or next((m for m in sorted(mons, key=lambda m: m["id"])), None)
+
+
+def windows_on(workspace):
+    return [c for c in hyprctl_json("clients") if c["workspace"]["name"] == workspace]
+
+
+def route_audio(pid, sink):
+    out = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"], capture_output=True, text=True).stdout
+    for s in json.loads(out or "[]"):
+        if s.get("properties", {}).get("application.process.id") == str(pid):
+            subprocess.run(["pactl", "move-sink-input", str(s["index"]), sink], capture_output=True)
+
+
+# ---------- config and state ----------
+
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = DEFAULT_CONFIG
+        save_json(CONFIG, cfg)
+    return cfg
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"main": {}, "layout": {}}
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def scene_ws(scene_id):
+    return f"tv-{scene_id}"
+
+
+def current_scene():
+    m = tv_monitor()
+    if not m:
+        return None
+    name = m["activeWorkspace"]["name"]
+    return name[3:] if name.startswith("tv-") else None
+
+
+def tv_position():
+    """TV below the laptop when the laptop is flipped onto the bed mount
+    (display-flip state 2), above it otherwise. Same rule as monitors.lua."""
+    state = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "display-flip")
+    try:
+        with open(state) as f:
+            flipped = f.read().strip() == "2"
+    except OSError:
+        flipped = False
+    return "auto-center-down" if flipped else "auto-center-up"
+
+
+# ---------- commands ----------
+
+def cmd_up(size="1920x1080"):
+    if not tv_monitor():
+        subprocess.run(["hyprctl", "-q", "output", "create", "headless", OUT])
+        time.sleep(0.3)
+    lua(f'hl.monitor({{ output = "{OUT}", mode = "{size}@30", position = "{tv_position()}", scale = 1 }})')
+    # monitors.lua reads this back, so a Hyprland reload keeps the TV's size.
+    os.makedirs(os.path.dirname(SIZE_FILE), exist_ok=True)
+    with open(SIZE_FILE, "w") as f:
+        f.write(size + "\n")
+    first = load_config()["scenes"][0]["id"]
+    if not (current_scene()):
+        show_scene(first)
+    sinks = subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True, text=True).stdout
+    if f"\t{SINK}\t" not in sinks:
+        subprocess.run(["pactl", "load-module", "module-null-sink", f"sink_name={SINK}",
+                        "sink_properties=device.description=TV"], capture_output=True)
+
+
+def cmd_down():
+    if not tv_monitor():
+        return
+    rotation(False)
+    home = laptop_monitor()["activeWorkspace"]["name"]
+    tv_apps = {w["pid"] for w in [browser_window()] if w}
+    for c in hyprctl_json("clients"):
+        if c["workspace"]["name"].startswith("tv-") and (is_board(c) or c["pid"] in tv_apps):
+            # The board and TV browser exist only for the TV: close, don't bring home.
+            dispatch(f'hl.dsp.window.close({{ window = "address:{c["address"]}" }})')
+            continue
+        if c["workspace"]["name"].startswith("tv-"):
+            clear_window(c["address"])
+            dispatch(f'hl.dsp.window.move({{ workspace = "{home}", window = "address:{c["address"]}", follow = false }})')
+            route_audio(c["pid"], "@DEFAULT_SINK@")
+    subprocess.run(["hyprctl", "-q", "output", "remove", OUT])
+    mods = subprocess.run(["pactl", "list", "short", "modules"], capture_output=True, text=True).stdout
+    for line in mods.splitlines():
+        if f"sink_name={SINK}" in line:
+            subprocess.run(["pactl", "unload-module", line.split("\t")[0]])
+
+
+def cmd_send():
+    tv = tv_monitor()
+    if not tv:
+        print("TV desktop is not up", file=sys.stderr)
+        sys.exit(1)
+    w = json.loads(subprocess.run(["hyprctl", "-j", "activewindow"], capture_output=True, text=True).stdout or "{}")
+    if not w.get("address"):
+        return
+    addr = w["address"]
+    if w["monitor"] == tv["id"]:
+        clear_window(addr)
+        home = laptop_monitor()["activeWorkspace"]["name"]
+        dispatch(f'hl.dsp.window.move({{ workspace = "{home}", window = "address:{addr}", follow = false }})')
+        route_audio(w["pid"], "@DEFAULT_SINK@")
+    else:
+        scene = current_scene() or load_config()["scenes"][0]["id"]
+        dispatch(f'hl.dsp.window.move({{ workspace = "name:{scene_ws(scene)}", window = "address:{addr}", follow = false }})')
+        route_audio(w["pid"], SINK)
+        state = load_state()
+        stack = [a for a in state.get("sent", []) if a != addr] + [addr]
+        state["sent"] = stack[-20:]
+        # The window just sent is what you want to see: make it the main one, and
+        # if the scene was one full-screen window, show the others as a PiP inset.
+        state["main"][scene] = addr
+        if scene_layout(scene) == "full" and len(windows_on(scene_ws(scene))) > 1:
+            state["layout"][scene] = "pip"
+        save_json(STATE, state)
+        apply_layout(scene)
+
+
+def cmd_to_tv():
+    tv = tv_monitor()
+    if not tv:
+        notify("The TV isn't on. Command+Shift+T, then O starts it.")
+        return
+    w = json.loads(subprocess.run(["hyprctl", "-j", "activewindow"], capture_output=True, text=True).stdout or "{}")
+    if not w.get("address"):
+        return
+    if w["monitor"] == tv["id"]:
+        notify("That window is already on the TV")
+        return
+    cmd_send()
+    notify(f"On the TV: {w['title'][:40]}")
+
+
+def cmd_home():
+    tv = tv_monitor()
+    if not tv:
+        notify("The TV isn't on")
+        return
+    w = json.loads(subprocess.run(["hyprctl", "-j", "activewindow"], capture_output=True, text=True).stdout or "{}")
+    if w.get("address") and w["monitor"] == tv["id"]:
+        scene = w["workspace"]["name"][3:]
+        state = load_state()
+        state["sent"] = [a for a in state.get("sent", []) if a != w["address"]]
+        save_json(STATE, state)
+        bring_home(w)
+        apply_layout(scene)
+        notify(f"Brought back: {w['title'][:40]}")
+    else:
+        cmd_back()
+
+
+# TV mode: Command+Shift+T enters it; each key does one thing and leaves.
+KEYS = [
+    ("s", "Send this window to the TV", ["to-tv"]),
+    ("b", "Bring a window back", ["home"]),
+    ("n", "Next scene", ["next"]),
+    ("p", "Previous scene", ["prev"]),
+    ("l", "Layout: full / split / PiP", ["layout", "next"]),
+    ("m", "Make the other window the main one", ["swap"]),
+    ("f", "Full screen the video", ["video-full"]),
+    ("r", "Rotation on/off", ["rotate", "toggle"]),
+    ("y", "YouTube on the TV's own app / back", ["native"]),
+    ("o", "On/off: start or stop casting", None),
+    ("a", "Re-sync sound and picture", None),
+]
+SUBMAP = "raytube-tv"
+
+
+def cmd_video_full():
+    """Show the TV browser's scene with the video as the one full-screen window."""
+    w = browser_window()
+    if not w or not w["workspace"]["name"].startswith("tv-"):
+        notify("No video on the TV. Start one with: raytube-tv browser <url>")
+        return
+    scene = w["workspace"]["name"][3:]
+    state = load_state()
+    state["main"][scene] = w["address"]
+    state["layout"][scene] = "full"
+    save_json(STATE, state)
+    show_scene(scene)
+    apply_layout(scene, "full")
+    # Then YouTube's own player, so only the video fills the TV.
+    try:
+        media("tv-fullscreen")
+    except (RuntimeError, subprocess.TimeoutExpired):
+        pass
+    notify("Video full screen")
+
+
+def cmd_tv_mode():
+    lua(f'hl.dispatch(hl.dsp.submap("{SUBMAP}"))')
+    sheet = "\n".join(f"{k.upper()}   {label}" for k, label, _ in KEYS) + "\nEsc  leave TV mode"
+    subprocess.run(["notify-send", "-t", "10000", "-h", "string:x-canonical-private-synchronous:raytube-tv",
+                    "TV mode", sheet], capture_output=True)
+
+
+def cmd_key(letter):
+    lua('hl.dispatch(hl.dsp.submap("reset"))')
+    os.environ["RAYTUBE_NOTIFY"] = "1"
+    entry = next((e for e in KEYS if e[0] == letter), None)
+    if not entry:
+        notify("TV mode off")
+        return
+    if entry[2] is None:
+        cast = os.path.join(os.path.dirname(os.path.realpath(__file__)), "raytube-cast")
+        subprocess.run([cast, "resync" if letter == "a" else "tv"])
+        return
+    main([sys.argv[0]] + entry[2])
+
+
+def bring_home(c):
+    clear_window(c["address"])
+    home = laptop_monitor()["activeWorkspace"]["name"]
+    dispatch(f'hl.dsp.window.move({{ workspace = "{home}", window = "address:{c["address"]}", follow = false }})')
+    route_audio(c["pid"], "@DEFAULT_SINK@")
+
+
+def cmd_back():
+    """Bring the most recently sent window that is still on the TV home."""
+    state = load_state()
+    on_tv = {c["address"]: c for c in hyprctl_json("clients") if c["workspace"]["name"].startswith("tv-")}
+    stack = [a for a in state.get("sent", []) if a in on_tv]
+    if not stack:
+        notify("No sent windows left on the TV")
+        return
+    addr = stack.pop()
+    state["sent"] = stack
+    save_json(STATE, state)
+    scene = on_tv[addr]["workspace"]["name"][3:]
+    bring_home(on_tv[addr])
+    apply_layout(scene)
+    notify(f"Brought back: {on_tv[addr]['title'][:40]}")
+
+
+def show_scene(scene_id):
+    """Put a scene on the TV without taking focus from the laptop."""
+    focused = next((m["name"] for m in hyprctl_json("monitors") if m["focused"]), (laptop_monitor() or {}).get("name", ""))
+    dispatch(f'hl.dsp.focus({{ monitor = "{OUT}" }})')
+    dispatch(f'hl.dsp.focus({{ workspace = "name:{scene_ws(scene_id)}" }})')
+    dispatch(f'hl.dsp.workspace.move({{ monitor = "{OUT}" }})')
+    if focused != OUT:
+        dispatch(f'hl.dsp.focus({{ monitor = "{focused}" }})')
+
+
+def populated_scenes(cfg, only_rotating=False):
+    ids = []
+    for s in cfg["scenes"]:
+        if only_rotating and not s.get("rotate"):
+            continue
+        if windows_on(scene_ws(s["id"])):
+            ids.append(s["id"])
+    return ids
+
+
+def cmd_step(delta):
+    cfg = load_config()
+    ids = populated_scenes(cfg) or [s["id"] for s in cfg["scenes"]]
+    cur = current_scene()
+    i = ids.index(cur) if cur in ids else -1
+    show_scene(ids[(i + delta) % len(ids)])
+
+
+# ---------- layouts ----------
+
+def clear_window(addr):
+    dispatch(f'hl.dsp.window.fullscreen_state({{ internal = 0, client = 0, window = "address:{addr}" }})')
+    dispatch(f'hl.dsp.window.float({{ action = "disable", window = "address:{addr}" }})')
+
+
+def main_and_rest(scene_id, wins):
+    state = load_state()
+    main = state["main"].get(scene_id)
+    addrs = [w["address"] for w in wins]
+    if main not in addrs:
+        # Largest window becomes the main one.
+        main = max(wins, key=lambda w: w["size"][0] * w["size"][1])["address"]
+        state["main"][scene_id] = main
+        save_json(STATE, state)
+    return main, [a for a in addrs if a != main]
+
+
+def scene_layout(scene_id):
+    state = load_state()
+    if scene_id in state["layout"]:
+        return state["layout"][scene_id]
+    cfg = load_config()
+    return next((s.get("layout", "full") for s in cfg["scenes"] if s["id"] == scene_id), "full")
+
+
+def apply_layout(scene_id, layout=None):
+    tv = tv_monitor()
+    wins = windows_on(scene_ws(scene_id))
+    if not tv or not wins:
+        return
+    layout = layout or scene_layout(scene_id)
+    main, rest = main_and_rest(scene_id, wins)
+    for a in [main] + rest:
+        clear_window(a)
+    if layout == "full" or not rest:
+        # True fullscreen: no gaps or border on the TV. (PiP uses maximized,
+        # because floating insets must stay visible above the main window.)
+        dispatch(f'hl.dsp.window.fullscreen_state({{ internal = 2, client = 0, window = "address:{main}" }})')
+    elif layout == "pip":
+        dispatch(f'hl.dsp.window.fullscreen_state({{ internal = 1, client = 0, window = "address:{main}" }})')
+        w, h = tv["width"] * 30 // 100, tv["height"] * 30 // 100
+        margin = tv["height"] * 4 // 100
+        for i, a in enumerate(rest):
+            x = tv["x"] + tv["width"] - (w + margin) * (i + 1)
+            y = tv["y"] + tv["height"] - h - margin
+            dispatch(f'hl.dsp.window.float({{ action = "enable", window = "address:{a}" }})')
+            dispatch(f'hl.dsp.window.resize({{ x = {w}, y = {h}, window = "address:{a}" }})')
+            dispatch(f'hl.dsp.window.move({{ x = {x}, y = {y}, window = "address:{a}" }})')
+    elif layout == "split" and len(rest) == 1:
+        side_by_side(tv, main, rest[0])
+    # "split" with 3+ windows: left to dwindle's own tiling.
+
+
+def side_by_side(tv, a, b):
+    """Dwindle splits along whatever it chose first; on a wide TV, two windows
+    stacked top and bottom waste the screen. Flip the split if they're stacked."""
+    time.sleep(0.15)
+    wins = {c["address"]: c for c in hyprctl_json("clients")}
+    if a not in wins or b not in wins or wins[a]["at"][0] != wins[b]["at"][0]:
+        return
+    focused = next((m["name"] for m in hyprctl_json("monitors") if m["focused"]), (laptop_monitor() or {}).get("name", ""))
+    dispatch(f'hl.dsp.focus({{ window = "address:{a}" }})')
+    dispatch('hl.dsp.layout("togglesplit")')
+    if focused != OUT:
+        dispatch(f'hl.dsp.focus({{ monitor = "{focused}" }})')
+
+
+def cmd_layout(name):
+    scene = current_scene()
+    if not scene:
+        sys.exit("TV desktop is not up")
+    state = load_state()
+    if name == "next":
+        cmd_layout_next(scene)
+        return
+    if name not in LAYOUTS:
+        sys.exit(f"layout is one of {', '.join(LAYOUTS)} or next")
+    state["layout"][scene] = name
+    save_json(STATE, state)
+    apply_layout(scene, name)
+
+
+def layout_steps(scene):
+    """The order L steps through: each window as the PiP main, then split, then each
+    window full screen. Most recently sent windows come first."""
+    wins = windows_on(scene_ws(scene))
+    addrs = [w["address"] for w in wins]
+    sent = [a for a in reversed(load_state().get("sent", [])) if a in addrs]
+    order = sent + sorted(a for a in addrs if a not in sent)
+    if len(order) < 2:
+        return [("full", a) for a in order]
+    return [("pip", a) for a in order] + [("split", order[0])] + [("full", a) for a in order]
+
+
+def cmd_layout_next(scene):
+    steps = layout_steps(scene)
+    if not steps:
+        return
+    state = load_state()
+    here = (scene_layout(scene), state["main"].get(scene))
+    i = steps.index(here) if here in steps else -1
+    layout, main = steps[(i + 1) % len(steps)]
+    state["layout"][scene], state["main"][scene] = layout, main
+    save_json(STATE, state)
+    apply_layout(scene, layout)
+    title = next((w["title"] for w in windows_on(scene_ws(scene)) if w["address"] == main), "")[:30]
+    notify({"pip": f"Picture in picture: {title} big", "split": "Side by side",
+            "full": f"Full screen: {title}"}[layout])
+
+
+def cmd_swap():
+    scene = current_scene()
+    wins = windows_on(scene_ws(scene)) if scene else []
+    if len(wins) < 2:
+        return
+    main, rest = main_and_rest(scene, wins)
+    state = load_state()
+    state["main"][scene] = rest[0]
+    save_json(STATE, state)
+    apply_layout(scene)
+
+
+# ---------- family board ----------
+
+BOARD_CLASS = "raytube-board"
+BOARD_URL = "file://" + os.path.join(os.path.dirname(os.path.realpath(__file__)), "board", "index.html")
+
+
+def is_board(c):
+    # Chromium --app windows are named after the URL, whatever --class says.
+    return c["class"] == BOARD_CLASS or "raytube_board_index.html" in c["class"]
+
+
+def cmd_board():
+    if not tv_monitor():
+        sys.exit("TV desktop is not up")
+    board = next((c for c in hyprctl_json("clients") if is_board(c)), None)
+    if not board:
+        env = dict(os.environ, PULSE_SINK=SINK)
+        subprocess.Popen(
+            ["chromium", "--ozone-platform=wayland", f"--class={BOARD_CLASS}",
+             "--user-data-dir=" + os.path.expanduser("~/.local/share/raytube/board-chromium"),
+             "--no-first-run", "--no-default-browser-check", "--disable-translate",
+             "--allow-file-access-from-files", f"--app={BOARD_URL}"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(60):
+            time.sleep(0.25)
+            board = next((c for c in hyprctl_json("clients") if is_board(c)), None)
+            if board:
+                break
+        if not board:
+            sys.exit("the board window did not appear")
+    if board["workspace"]["name"] != scene_ws("board"):
+        dispatch(f'hl.dsp.window.move({{ workspace = "name:{scene_ws("board")}", window = "address:{board["address"]}", follow = false }})')
+    state = load_state()
+    state["main"]["board"] = board["address"]
+    save_json(STATE, state)
+    show_scene("board")
+    apply_layout("board")
+
+
+# ---------- TV browser and native YouTube ----------
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+BROWSER_PROFILE = os.path.expanduser("~/.local/share/raytube/tv-firefox")
+NATIVE_STATE = os.path.expanduser("~/.local/state/raytube/native.json")
+BROWSER_PREFS = """// Raytube TV browser: hardware H.264 on the Intel GPU (see Firefox setup),
+// no first-run pages, remote control over WebDriver BiDi on localhost.
+user_pref("media.ffmpeg.vaapi.enabled", true);
+user_pref("media.hardware-video-decoding.force-enabled", true);
+user_pref("media.av1.enabled", false);
+user_pref("media.mediasource.vp9.enabled", false);
+user_pref("media.autoplay.default", 0);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("browser.sessionstore.resume_from_crash", false);
+"""
+
+
+def media(*args):
+    out = subprocess.run(["uv", "run", "--quiet", "--with", "pychromecast", "--with", "websockets",
+                          os.path.join(HERE, "raytube-media.py"), *args],
+                         capture_output=True, text=True, timeout=90)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip().splitlines()[-1] if out.stderr.strip() else "raytube-media failed")
+    return json.loads(out.stdout or "{}")
+
+
+def browser_window():
+    pid = None
+    try:
+        with open(os.path.join(BROWSER_PROFILE, ".raytube-pid")) as f:
+            pid = int(f.read())
+    except (OSError, ValueError):
+        return None
+    return next((c for c in hyprctl_json("clients") if c["pid"] == pid), None)
+
+
+def cmd_browser(url=None, scene="watch"):
+    if not tv_monitor():
+        sys.exit("TV desktop is not up")
+    win = browser_window()
+    if win and url:
+        media("tv-open", url)
+    elif not win:
+        os.makedirs(BROWSER_PROFILE, exist_ok=True)
+        with open(os.path.join(BROWSER_PROFILE, "user.js"), "w") as f:
+            f.write(BROWSER_PREFS)
+        env = dict(os.environ, PULSE_SINK=SINK, MOZ_DRM_DEVICE="/dev/dri/renderD129", MOZ_ENABLE_WAYLAND="1")
+        proc = subprocess.Popen(["firefox", "--no-remote", "--profile", BROWSER_PROFILE, "--kiosk",
+                                 "--remote-debugging-port", "9337", url or "https://www.youtube.com/"],
+                                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        with open(os.path.join(BROWSER_PROFILE, ".raytube-pid"), "w") as f:
+            f.write(str(proc.pid))
+        for _ in range(80):
+            time.sleep(0.25)
+            win = browser_window()
+            if win:
+                break
+        if not win:
+            sys.exit("the TV browser window did not appear")
+    if win["workspace"]["name"] != scene_ws(scene):
+        dispatch(f'hl.dsp.window.move({{ workspace = "name:{scene_ws(scene)}", window = "address:{win["address"]}", follow = false }})')
+    show_scene(scene)
+    apply_layout(scene)
+
+
+def casting_to():
+    """(ip, name, kind) of the current cast, or None."""
+    st = subprocess.run([os.path.join(HERE, "raytube-cast"), "status"], capture_output=True, text=True).stdout.split("\t")
+    if st[0].strip() != "on":
+        return None
+    ip, name = st[1].strip(), st[2].strip()
+    lst = subprocess.run([os.path.join(HERE, "raytube-cast"), "list"], capture_output=True, text=True).stdout
+    kind = next((l.split("\t")[3] for l in lst.splitlines() if l.split("\t")[1:2] == [ip]), "")
+    return ip, name, kind.strip()
+
+
+def cmd_native():
+    try:
+        with open(NATIVE_STATE) as f:
+            native = json.load(f)
+    except (OSError, ValueError):
+        native = None
+    if native:
+        return cmd_pull(native["ip"], native["name"])
+    cur = casting_to()
+    if not cur or cur[2] != "cast":
+        notify("Native YouTube needs a TV desktop cast to a Chromecast")
+        return
+    ip, name, _ = cur
+    video = media("tv-video")
+    if not video:
+        notify("No YouTube video in the TV browser")
+        return
+    media("tv-pause")
+    subprocess.run([os.path.join(HERE, "raytube-cast"), "release"])
+    media("cc-youtube", ip, video["video_id"], str(video["time"]))
+    save_json(NATIVE_STATE, {"ip": ip, "name": name, "video_id": video["video_id"]})
+    notify(f"Playing natively on {name} (TV mode, then Y, to come back)")
+
+
+def cmd_pull(ip=None, name=None):
+    if not ip:
+        try:
+            with open(os.path.join(os.path.expanduser("~/.local/state/raytube"), "last-receiver")) as f:
+                ip, name = f.read().strip().split("\t")
+        except (OSError, ValueError):
+            sys.exit("no receiver known yet: cast once from the Display menu")
+    status = media("cc-status", ip)
+    if status.get("app") != "YouTube" or not status.get("video_id"):
+        notify(f"{name} is not playing YouTube")
+        if os.path.exists(NATIVE_STATE):
+            os.remove(NATIVE_STATE)
+        return
+    media("cc-quit", ip)
+    if os.path.exists(NATIVE_STATE):
+        os.remove(NATIVE_STATE)
+    url = f"https://www.youtube.com/watch?v={status['video_id']}&t={status['time']}s"
+    subprocess.run([os.path.join(HERE, "raytube-cast"), "mode", "desktop"], capture_output=True)
+    subprocess.run([os.path.join(HERE, "raytube-cast"), "start", ip, name])
+    cmd_browser(url)
+    notify(f"Pulled \"{status.get('title') or status['video_id']}\" onto the TV desktop")
+
+
+# ---------- rotation ----------
+
+def rotating():
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", ROTATION_UNIT]).returncode == 0
+
+
+def rotation(on):
+    if on and not rotating():
+        subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={ROTATION_UNIT}",
+                        os.path.abspath(__file__), "rotate-daemon"])
+    elif not on and rotating():
+        subprocess.run(["systemctl", "--user", "stop", ROTATION_UNIT])
+
+
+def cmd_rotate(arg):
+    if arg == "toggle":
+        arg = "off" if rotating() else "on"
+    rotation(arg == "on")
+    print("on" if arg == "on" else "off")
+
+
+def rotate_daemon():
+    while tv_monitor():
+        cfg = load_config()
+        ids = populated_scenes(cfg, only_rotating=True)
+        if not ids:
+            time.sleep(5)
+            continue
+        cur = current_scene()
+        nxt = ids[(ids.index(cur) + 1) % len(ids)] if cur in ids else ids[0]
+        show_scene(nxt)
+        seconds = next(s.get("seconds", 60) for s in cfg["scenes"] if s["id"] == nxt)
+        state = load_state()
+        state["rotation_next_at"] = time.time() + seconds
+        save_json(STATE, state)
+        time.sleep(max(5, seconds))
+
+
+def cmd_rotate_scene(scene_id, on):
+    cfg = load_config()
+    for s in cfg["scenes"]:
+        if s["id"] == scene_id:
+            s["rotate"] = on == "on"
+    save_json(CONFIG, cfg)
+
+
+# ---------- status ----------
+
+def cmd_status():
+    tv = tv_monitor()
+    print(f"up {tv['width']}x{tv['height']}" if tv else "down")
+
+
+def cmd_json():
+    tv = tv_monitor()
+    cfg = load_config()
+    state = load_state()
+    cur = current_scene()
+    scenes = []
+    for s in cfg["scenes"]:
+        scenes.append({
+            "id": s["id"], "label": s.get("label", s["id"]), "rotate": bool(s.get("rotate")),
+            "seconds": s.get("seconds", 60), "layout": scene_layout(s["id"]),
+            "windows": len(windows_on(scene_ws(s["id"]))) if tv else 0,
+            "current": s["id"] == cur,
+        })
+    nxt = state.get("rotation_next_at")
+    print(json.dumps({
+        "up": bool(tv), "size": f"{tv['width']}x{tv['height']}" if tv else "",
+        "scene": cur, "rotation": rotating(),
+        "next_in": max(0, int(nxt - time.time())) if (nxt and rotating()) else None,
+        "scenes": scenes,
+    }))
+
+
+def notify(msg):
+    """Brief on-screen confirmation for hotkeys (RAYTUBE_NOTIFY=1)."""
+    if os.environ.get("RAYTUBE_NOTIFY"):
+        subprocess.run(["notify-send", "-t", "1500", "-h", "string:x-canonical-private-synchronous:raytube-tv",
+                        "TV desktop", msg], capture_output=True)
+
+
+def scene_label(scene_id):
+    return next((s.get("label", s["id"]) for s in load_config()["scenes"] if s["id"] == scene_id), scene_id)
+
+
+def main(argv):
+    cmd, args = (argv[1] if len(argv) > 1 else ""), argv[2:]
+    if cmd == "up":
+        cmd_up(args[0] if args else "1920x1080")
+    elif cmd == "down":
+        cmd_down()
+    elif cmd == "send":
+        cmd_send()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "back":
+        cmd_back()
+    elif cmd == "to-tv":
+        cmd_to_tv()
+    elif cmd == "home":
+        cmd_home()
+    elif cmd == "video-full":
+        cmd_video_full()
+    elif cmd == "tv-mode":
+        cmd_tv_mode()
+    elif cmd == "key" and args:
+        cmd_key(args[0].lower())
+    elif cmd == "json":
+        cmd_json()
+    elif cmd == "scene" and args:
+        show_scene(args[0])
+    elif cmd in ("next", "prev"):
+        if not tv_monitor():
+            return notify("Not casting the TV desktop (TV mode, then O, starts it)")
+        cmd_step(1 if cmd == "next" else -1)
+        notify(f"Scene: {scene_label(current_scene())}")
+    elif cmd == "layout" and args:
+        cmd_layout(args[0])
+        notify(f"Layout: {scene_layout(current_scene())}")
+    elif cmd == "swap":
+        cmd_swap()
+        notify("Swapped main and inset")
+    elif cmd == "rotate" and args and args[0] in ("on", "off", "toggle"):
+        cmd_rotate(args[0])
+        notify("Rotation on" if rotating() else "Rotation off")
+    elif cmd == "rotate-daemon":
+        rotate_daemon()
+    elif cmd == "board":
+        cmd_board()
+    elif cmd == "browser":
+        cmd_browser(args[0] if args else None)
+    elif cmd == "native":
+        cmd_native()
+    elif cmd == "pull":
+        cmd_pull()
+    elif cmd == "rotate-scene" and len(args) == 2:
+        cmd_rotate_scene(args[0], args[1])
+    else:
+        print(__doc__.strip())
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

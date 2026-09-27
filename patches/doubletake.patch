@@ -1,0 +1,804 @@
+diff --git i/cmd/doubletake/main.go w/cmd/doubletake/main.go
+index b49aab6..b06dcd0 100644
+--- i/cmd/doubletake/main.go
++++ w/cmd/doubletake/main.go
+@@ -67,7 +67,7 @@ func main() {
+ 	fps := flag.Int("fps", 30, "Frames per second")
+ 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
+ 	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic AirPlay policy)")
+-	hwaccel := flag.String("hwaccel", "auto", "Encoder: auto, nvenc, vaapi, openh264, none (x264/x265)")
++	hwaccel := flag.String("hwaccel", "auto", "Encoder: auto, nvenc, vaapi, intel (ffmpeg VA-API), openh264, none (x264/x265)")
+ 	videoCodec := flag.String("video-codec", "auto", "Screen codec: auto, h264, or hevc (auto uses capability-gated hardware HEVC for high-resolution receivers)")
+ 	testMode := flag.Bool("test", false, "Use synthetic video (videotestsrc) instead of screen capture for debugging")
+ 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
+@@ -464,7 +464,9 @@ func main() {
+ 			defer audioCapture.Stop()
+ 			go func() {
+ 				if err := session.StreamAudio(ctx, audioCapture, session.AudioStream()); err != nil && ctx.Err() == nil {
+-					log.Printf("audio streaming error: %v", err)
++					// Exit non-zero so a supervisor (cast-tv.sh) restarts the whole
++					// stream; otherwise video continues with audio silently dead.
++					log.Fatalf("audio streaming error: %v", err)
+ 				}
+ 			}()
+ 			log.Println("audio capture started")
+diff --git i/internal/airplay/audio.go w/internal/airplay/audio.go
+index a848686..b9d9ecf 100644
+--- i/internal/airplay/audio.go
++++ w/internal/airplay/audio.go
+@@ -11,7 +11,9 @@ import (
+ 	"io"
+ 	"log"
+ 	"net"
++	"os"
+ 	"os/exec"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -117,6 +119,14 @@ type AudioCapture struct {
+ 	codec     AudioCodec
+ 	eldMu     sync.Mutex
+ 	eld       *eldEncoder
++	// ptsDelay shifts every audio timestamp later. Video frames from the
++	// wf-recorder path are stamped when their encoded bytes arrive, after
++	// capture and encode, so audio stamped at capture would play early.
++	ptsDelay time.Duration
++	// delayFile, when set, is re-read every half second so the delay can be
++	// tuned live (DOUBLETAKE_AUDIO_DELAY_FILE: a number of milliseconds).
++	delayFile      string
++	delayCheckedAt time.Time
+ }
+ 
+ var audioTimestampFallbackWarning sync.Once
+@@ -198,6 +208,10 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
+ 			return nil, fmt.Errorf("no PulseAudio monitor source found")
+ 		}
+ 		srcArgs = []string{"pulsesrc", fmt.Sprintf("device=%s", monitor)}
++		// DOUBLETAKE_PULSE_PROPS appends pulsesrc properties, e.g.
++		// "buffer-time=40000 latency-time=10000". The 200 ms default buffer can
++		// deliver samples close to the playout lead, so many are dropped as stale.
++		srcArgs = append(srcArgs, strings.Fields(os.Getenv("DOUBLETAKE_PULSE_PROPS"))...)
+ 		dbg("[AUDIO] using pulsesrc device=%s", monitor)
+ 	} else if exec.Command("gst-inspect-1.0", "pipewiresrc").Run() == nil {
+ 		srcArgs = []string{"pipewiresrc"}
+@@ -212,6 +226,13 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
+ 		waitCh: make(chan struct{}),
+ 		codec:  codec,
+ 	}
++	// DOUBLETAKE_AUDIO_DELAY_MS: play audio this much later to line up with video
++	// whose timestamps include capture and encode time (see ptsDelay).
++	if ms, err := strconv.Atoi(os.Getenv("DOUBLETAKE_AUDIO_DELAY_MS")); err == nil && ms > 0 && ms <= 2000 {
++		ac.ptsDelay = time.Duration(ms) * time.Millisecond
++	}
++	ac.delayFile = os.Getenv("DOUBLETAKE_AUDIO_DELAY_FILE")
++	ac.refreshDelay()
+ 	if codec == AudioCodecAACELD {
+ 		var err error
+ 		ac.eld, err = newELDEncoder()
+@@ -280,6 +301,28 @@ func (ac *AudioCapture) ReadFrameAt(buf []byte) (int, time.Time, error) {
+ 	return n, position.PTS, err
+ }
+ 
++// refreshDelay re-reads delayFile at most every 500 ms. A changed delay moves
++// the audio timestamps, which the next TimeAnnounce (about once a second, or at
++// once for a jump back over 100 ms) passes on to the receiver.
++func (ac *AudioCapture) refreshDelay() {
++	if ac.delayFile == "" || time.Since(ac.delayCheckedAt) < 500*time.Millisecond {
++		return
++	}
++	ac.delayCheckedAt = time.Now()
++	raw, err := os.ReadFile(ac.delayFile)
++	if err != nil {
++		return
++	}
++	ms, err := strconv.Atoi(strings.TrimSpace(string(raw)))
++	if err != nil || ms < 0 || ms > 2000 {
++		return
++	}
++	if d := time.Duration(ms) * time.Millisecond; d != ac.ptsDelay {
++		log.Printf("audio delay now %v", d)
++		ac.ptsDelay = d
++	}
++}
++
+ func (ac *AudioCapture) readFramePosition(buf []byte) (int, audioPCMFramePosition, error) {
+ 	select {
+ 	case <-ac.waitCh:
+@@ -310,6 +353,10 @@ func (ac *AudioCapture) readFramePosition(buf []byte) (int, audioPCMFramePositio
+ 	if err != nil {
+ 		return 0, audioPCMFramePosition{}, err
+ 	}
++	ac.refreshDelay()
++	if !position.PTS.IsZero() {
++		position.PTS = position.PTS.Add(ac.ptsDelay)
++	}
+ 	if ac.codec == AudioCodecAACELD {
+ 		ac.eldMu.Lock()
+ 		defer ac.eldMu.Unlock()
+@@ -1267,6 +1314,16 @@ videoReady:
+ 	framePTS := firstFramePosition.PTS
+ 	frameRTP := firstFrameRTP
+ 	staleFrames := 0
++	var staleSince time.Time
++	// Audio-only restarts: replacing a stuck capture keeps the picture going.
++	// Two within a minute means something bigger is wrong: restart everything.
++	var captureRestarts []time.Time
++	original := capture // the caller stops this one; stop any replacement here
++	defer func() {
++		if capture != original {
++			capture.Stop()
++		}
++	}()
+ 
+ 	for {
+ 		select {
+@@ -1299,6 +1356,37 @@ videoReady:
+ 			framePosition.PTS = framePTS
+ 		}
+ 		if !usingFirstFrame && timestampedAudio && audioFrameIsStale(framePTS, time.Now(), audioStream.latencySamples) {
++			// A starved capture can leave the audio server holding a permanently
++			// larger buffer, so every sample stays late and dropping cannot catch
++			// up. After 3 s of continuous staleness, fail the stream so the caller
++			// restarts with fresh capture buffers instead of staying silent.
++			if staleFrames == 0 {
++				staleSince = time.Now()
++			} else if time.Since(staleSince) > 3*time.Second {
++				behind := time.Since(framePTS).Round(time.Millisecond)
++				recent := captureRestarts[:0]
++				for _, t := range captureRestarts {
++					if time.Since(t) < time.Minute {
++						recent = append(recent, t)
++					}
++				}
++				captureRestarts = recent
++				if len(captureRestarts) >= 2 {
++					return fmt.Errorf("audio capture stuck %v behind real time for %v after %d audio-only restarts; restart needed",
++						behind, time.Since(staleSince).Round(time.Second), len(captureRestarts))
++				}
++				log.Printf("audio capture stuck %v behind real time for 3s; restarting audio capture only", behind)
++				capture.Stop()
++				next, err := StartAudioCapture(ctx, false, s.AudioCodec())
++				if err != nil {
++					return fmt.Errorf("audio capture restart: %w", err)
++				}
++				capture = next
++				capture.DrainStale()
++				captureRestarts = append(captureRestarts, time.Now())
++				staleFrames = 0
++				continue
++			}
+ 			staleFrames++
+ 			if staleFrames == 1 || staleFrames%100 == 0 {
+ 				dbg("[AUDIO] dropping stale source frame %v old (latency=%v, dropped=%d)",
+diff --git i/internal/airplay/capture.go w/internal/airplay/capture.go
+index 5aaf46b..b1b9fa2 100644
+--- i/internal/airplay/capture.go
++++ w/internal/airplay/capture.go
+@@ -23,7 +23,7 @@ import (
+ type CaptureConfig struct {
+ 	FPS        int
+ 	Bitrate    int        // Video bitrate in kbps (0 = auto)
+-	HWAccel    string     // "auto", "nvenc", "vaapi", "openh264", or "none"
++	HWAccel    string     // "auto", "nvenc", "vaapi", "intel", "openh264", or "none"
+ 	VideoCodec VideoCodec // empty/h264, auto (resolved before Start), or hevc
+ 
+ 	// MaxWidth/MaxHeight select the encoded canvas advertised by the receiver.
+@@ -45,10 +45,10 @@ type CaptureConfig struct {
+ // zero-value CaptureConfig useful and is treated as auto.
+ func ValidateHWAccel(method string) error {
+ 	switch method {
+-	case "", "auto", "nvenc", "vaapi", "openh264", "none":
++	case "", "auto", "nvenc", "vaapi", "intel", "openh264", "none":
+ 		return nil
+ 	default:
+-		return fmt.Errorf("unknown encoder %q (want auto, nvenc, vaapi, openh264, or none)", method)
++		return fmt.Errorf("unknown encoder %q (want auto, nvenc, vaapi, intel, openh264, or none)", method)
+ 	}
+ }
+ 
+@@ -82,6 +82,7 @@ const (
+ 	capturePreparationX11 capturePreparationKind = iota
+ 	capturePreparationWayland
+ 	capturePreparationTest
++	capturePreparationWfRecorder
+ )
+ 
+ // CapturePreparation performs the potentially interactive part of screen
+@@ -188,6 +189,14 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
+ 		return preparation, nil
+ 	}
+ 
++	if wfRecorderPath() != "" {
++		if cfg.HWAccel != "intel" {
++			return nil, fmt.Errorf("DOUBLETAKE_WF_RECORDER requires -hwaccel intel")
++		}
++		preparation.kind = capturePreparationWfRecorder
++		return preparation, nil
++	}
++
+ 	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
+ 		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
+ 	}
+@@ -361,6 +370,8 @@ func (p *CapturePreparation) startWithContextAndCodec(lifetime context.Context,
+ 		return startPreparedX11Capture(ctx, cfg, encoder, timestampedOutput)
+ 	case capturePreparationTest:
+ 		return startPreparedTestCapture(ctx, cfg, encoder, timestampedOutput)
++	case capturePreparationWfRecorder:
++		return startWfRecorderCapture(ctx, cfg, encoder, timestampedOutput)
+ 	default:
+ 		return nil, fmt.Errorf("invalid capture preparation kind %d", kind)
+ 	}
+@@ -712,6 +723,17 @@ type encoderResult struct {
+ 	needsVulkan bool   // encoder needs vulkanupload immediately before it
+ 	rawFormat   string // system-memory format produced by videoconvert
+ 	codec       VideoCodec
++	// ffmpegEncode, when set, replaces the GStreamer encoder: raw Y4M frames are
++	// piped through ffmpeg (VA-API scale/pad/encode) and back into GStreamer for
++	// RTP framing. Used for VA-API drivers GStreamer's va plugin cannot drive,
++	// such as Intel i965 (Haswell and older).
++	ffmpegEncode *ffmpegVAAPIEncoder
++}
++
++type ffmpegVAAPIEncoder struct {
++	device           string
++	bitrateKbps      int
++	keyframeInterval int
+ }
+ 
+ func frameRateStage(fps int) gstStage {
+@@ -726,7 +748,7 @@ func frameIntervalMillis(fps int) int {
+ }
+ 
+ func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int) gstStage {
+-	return gstStage{
++	stage := gstStage{
+ 		"pipewiresrc",
+ 		fmt.Sprintf("fd=%d", fd),
+ 		fmt.Sprintf("path=%d", nodeID),
+@@ -738,6 +760,10 @@ func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int) gstStage {
+ 		// as soon as pipewiresrc pulls it while downstream retains only the copy.
+ 		"always-copy=true",
+ 	}
++	// DOUBLETAKE_PW_PROPS appends pipewiresrc properties, e.g.
++	// "min-buffers=8 provide-clock=false" for compositors whose screencopy
++	// runs out of buffers and renegotiates in a loop.
++	return append(stage, strings.Fields(os.Getenv("DOUBLETAKE_PW_PROPS"))...)
+ }
+ 
+ func lowLatencyVideoQueueStage() gstStage {
+@@ -793,10 +819,23 @@ func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage
+ 		args = appendGstStage(args, stage)
+ 	}
+ 
+-	args = appendGstStage(args, gstStage{"videoconvert"})
++	if encoder.ffmpegEncode != nil && os.Getenv("DOUBLETAKE_GL_CONVERT") != "" {
++		// Convert on the GPU with a GL shader: ~31% of a core at 2880x1800@24
++		// versus ~200% for videoconvert. GL runs on the compositor's GPU; only
++		// its shaders are used, never its video encoder.
++		args = appendGstStage(args, gstStage{"glupload"})
++		args = appendGstStage(args, gstStage{"glcolorconvert"})
++		args = appendGstStage(args, gstStage{fmt.Sprintf("video/x-raw(memory:GLMemory),format=%s", encoder.rawFormat)})
++		args = appendGstStage(args, gstStage{"gldownload"})
++	} else {
++		args = appendGstStage(args, cpuConvertStage(encoder))
++	}
+ 	args = appendGstStage(args, gstStage{fmt.Sprintf("video/x-raw,format=%s", encoder.rawFormat)})
+-	for _, stage := range receiverScaleStages(maxWidth, maxHeight) {
+-		args = appendGstStage(args, stage)
++	if encoder.ffmpegEncode == nil {
++		// ffmpeg fits the frame to the receiver canvas on the GPU instead.
++		for _, stage := range receiverScaleStages(maxWidth, maxHeight) {
++			args = appendGstStage(args, stage)
++		}
+ 	}
+ 	for _, stage := range afterScale {
+ 		args = appendGstStage(args, stage)
+@@ -804,27 +843,53 @@ func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage
+ 	if encoder.needsVulkan {
+ 		args = appendGstStage(args, gstStage{"vulkanupload"})
+ 	}
+-	args = appendGstStage(args, encoder.parts)
++	if encoder.ffmpegEncode != nil {
++		args = appendGstStage(args, gstStage{"y4menc"})
++		args = appendGstStage(args, gstStage{ffmpegPipelineSplit})
++	} else {
++		args = appendGstStage(args, encoder.parts)
++	}
++	for _, stage := range packetizeStages(encoder.codec, timestampedOutput) {
++		args = appendGstStage(args, stage)
++	}
++	return args
++}
++
++// packetizeStages turns an encoded elementary stream into what the mirror
++// reader consumes on stdout.
++func packetizeStages(codec VideoCodec, timestampedOutput bool) []gstStage {
+ 	parser, mediaType, payloader := "h264parse", "video/x-h264", "rtph264pay"
+-	if encoder.codec == VideoCodecHEVC {
++	if codec == VideoCodecHEVC {
+ 		parser, mediaType, payloader = "h265parse", "video/x-h265", "rtph265pay"
+ 	}
+-	args = appendGstStage(args, gstStage{parser, "config-interval=-1"})
+-	args = appendGstStage(args, gstStage{mediaType + ",stream-format=byte-stream,alignment=au"})
++	stages := []gstStage{
++		{parser, "config-interval=-1"},
++		{mediaType + ",stream-format=byte-stream,alignment=au"},
++	}
+ 	if timestampedOutput {
+ 		// RTP marker bits retain access-unit boundaries, while the ONVIF header
+ 		// extension serializes each encoded buffer's absolute capture PTS. The
+ 		// RFC4571 length prefix makes the packet stream safe to carry over stdout.
+-		args = appendGstStage(args, gstStage{
+-			payloader, "pt=96", "mtu=60000", "aggregate-mode=none",
+-			"timestamp-offset=0", "seqnum-offset=0",
+-		})
+-		args = appendGstStage(args, gstStage{
+-			"rtponviftimestamp", "ntp-offset=-1", "set-e-bit=false", "set-t-bit=false",
+-		})
+-		args = appendGstStage(args, gstStage{"rtpstreampay"})
++		stages = append(stages,
++			gstStage{payloader, "pt=96", "mtu=60000", "aggregate-mode=none",
++				"timestamp-offset=0", "seqnum-offset=0"},
++			gstStage{"rtponviftimestamp", "ntp-offset=-1", "set-e-bit=false", "set-t-bit=false"},
++			gstStage{"rtpstreampay"},
++		)
+ 	}
+-	return appendGstStage(args, gstStage{"fdsink", "fd=1", "sync=false", "async=false"})
++	return append(stages, gstStage{"fdsink", "fd=1", "sync=false", "async=false"})
++}
++
++func cpuConvertStage(encoder encoderResult) gstStage {
++	convert := gstStage{"videoconvert"}
++	if encoder.ffmpegEncode != nil {
++		// The GPU encoder leaves conversion as the only CPU-heavy stage. The
++		// portal delivers BGRA, whose default conversion to I420 manages only
++		// ~13 fps at 2880x1800 here; skipping chroma resampling and dithering
++		// reaches ~32 fps with no visible difference on screen content.
++		convert = append(convert, "n-threads=4", "chroma-mode=none", "dither=none")
++	}
++	return convert
+ }
+ 
+ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoderParts encoderResult, nodeID uint32, pwFd *os.File, dbusConn *dbus.Conn, streamSize [2]int, timestampedOutput bool) (*ScreenCapture, error) {
+@@ -856,9 +921,23 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
+ 	source := pipeWireVideoSourceStage(pwFdNum, nodeID, fps)
+ 
+ 	hasCompositor := streamSize[0] > 0 && streamSize[1] > 0 && hasGstElement("compositor")
++	// DOUBLETAKE_NO_COMPOSITOR=1 relies on pipewiresrc keepalive for idle
++	// frames and rate-limits before conversion. The forced-live compositor only
++	// takes a new input once its output clock reaches that buffer's timestamp;
++	// when conversion falls behind real time it keeps repeating a stale frame.
++	noCompositor := os.Getenv("DOUBLETAKE_NO_COMPOSITOR") != ""
++	if noCompositor {
++		hasCompositor = false
++	}
+ 
+-	var beforeConvert []gstStage
+-	if hasGstElement("vapostproc") {
++	// Decouple pipewiresrc from downstream: if conversion or encoding falls
++	// behind, drop stale frames here rather than holding portal buffers. A
++	// consumer that stops returning buffers can leave xdg-desktop-portal-hyprland
++	// looping on "Out of buffers" and the stream frozen.
++	beforeConvert := []gstStage{lowLatencyVideoQueueStage()}
++	// DOUBLETAKE_NO_VAPOSTPROC=1 skips it, e.g. when the VA device cannot handle
++	// the capture size and the pipeline stalls after the first frames.
++	if os.Getenv("DOUBLETAKE_NO_VAPOSTPROC") == "" && hasGstElement("vapostproc") {
+ 		beforeConvert = append(beforeConvert, gstStage{"vapostproc"})
+ 	} else {
+ 		log.Printf("[CAPTURE] vapostproc unavailable, using software conversion")
+@@ -875,6 +954,15 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
+ 	}
+ 	if hasCompositor {
+ 		afterScale = append(afterScale, lowLatencyVideoQueueStage())
++	} else if noCompositor {
++		// Re-time onto a fixed grid (duplicating or dropping) rather than
++		// drop-only: portal frames land on uneven vsync boundaries, and
++		// drop-only discards so many that output falls well below fps.
++		beforeConvert = append(beforeConvert,
++			gstStage{"videorate", "skip-to-first=true"},
++			frameRateStage(fps),
++		)
++		afterScale = append(afterScale, lowLatencyVideoQueueStage())
+ 	} else {
+ 		afterScale = append(afterScale,
+ 			gstStage{"videorate", "drop-only=true", "skip-to-first=true"},
+@@ -885,7 +973,7 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
+ 	gstArgs := buildGstVideoPipeline(source, beforeConvert, afterScale, encoderParts, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
+ 
+ 	dbg("[CAPTURE] gst-launch-1.0 (wayland) %s", strings.Join(gstArgs, " "))
+-	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
++	cmd := newVideoCaptureCommand(captureCtx, gstArgs, encoderParts, cfg.MaxWidth, cfg.MaxHeight)
+ 	cmd.ExtraFiles = []*os.File{pwFd}
+ 
+ 	stdout, err := cmd.StdoutPipe()
+@@ -971,7 +1059,7 @@ func startPreparedX11Capture(ctx context.Context, cfg CaptureConfig, encoder enc
+ 	gstArgs := buildGstVideoPipeline(ximageSrcArgs, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
+ 
+ 	dbg("[CAPTURE] gst-launch-1.0 (x11) %s", strings.Join(gstArgs, " "))
+-	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
++	cmd := newVideoCaptureCommand(captureCtx, gstArgs, encoder, cfg.MaxWidth, cfg.MaxHeight)
+ 
+ 	stdout, err := cmd.StdoutPipe()
+ 	if err != nil {
+@@ -1190,6 +1278,10 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool,
+ 		return selectGstHEVCEncoder(cfg, hasElement, announce, hwaccel, bitrate, keyframeInterval)
+ 	}
+ 
++	if hwaccel == "intel" {
++		return selectFFmpegVAAPIEncoder(announce, bitrate, keyframeInterval)
++	}
++
+ 	vbvBuf := vbvBufferKbit(bitrate, fps)
+ 	maxrate := bitrate + bitrate/4 // allow 25% overshoot on peaks
+ 	candidates := []struct {
+@@ -1378,7 +1470,7 @@ func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder en
+ 	gstArgs := buildGstVideoPipeline(source, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
+ 
+ 	dbg("[CAPTURE] launching gst-launch-1.0 (test mode) %s", strings.Join(gstArgs, " "))
+-	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
++	cmd := newVideoCaptureCommand(captureCtx, gstArgs, encoder, cfg.MaxWidth, cfg.MaxHeight)
+ 
+ 	stdout, err := cmd.StdoutPipe()
+ 	if err != nil {
+diff --git i/internal/airplay/client.go w/internal/airplay/client.go
+index cd35c0e..9840517 100644
+--- i/internal/airplay/client.go
++++ w/internal/airplay/client.go
+@@ -13,6 +13,7 @@ import (
+ 	"io"
+ 	"log"
+ 	"net"
++	"os"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -195,6 +196,12 @@ func (i *ReceiverInfo) MirrorSize() (int, int) {
+ 	if i == nil {
+ 		return 0, 0
+ 	}
++	// DOUBLETAKE_CANVAS=WxH overrides the receiver's nominal canvas, e.g. when
++	// an Apple TV reports 1280x720 but its decoder accepts far more.
++	var ow, oh int
++	if _, err := fmt.Sscanf(os.Getenv("DOUBLETAKE_CANVAS"), "%dx%d", &ow, &oh); err == nil && ow > 0 && oh > 0 {
++		return ow &^ 1, oh &^ 1
++	}
+ 	if w, h := i.DisplaySize(); w > 0 && h > 0 {
+ 		return w, h
+ 	}
+diff --git i/internal/airplay/ffmpeg_encode.go w/internal/airplay/ffmpeg_encode.go
+new file mode 100644
+index 0000000..85e3d15
+--- /dev/null
++++ w/internal/airplay/ffmpeg_encode.go
+@@ -0,0 +1,219 @@
++package airplay
++
++import (
++	"context"
++	"fmt"
++	"log"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++)
++
++// ffmpegPipelineSplit marks where buildGstVideoPipeline hands raw Y4M frames to
++// ffmpeg. It never reaches gst-launch-1.0.
++const ffmpegPipelineSplit = "__doubletake_ffmpeg_split__"
++
++// selectFFmpegVAAPIEncoder chooses ffmpeg's h264_vaapi on an Intel render node.
++// GStreamer's va plugin cannot encode on the legacy i965 driver, but ffmpeg can.
++// DOUBLETAKE_VAAPI_DEVICE overrides the auto-detected device.
++func selectFFmpegVAAPIEncoder(announce bool, bitrate, keyframeInterval int) (encoderResult, error) {
++	if _, err := exec.LookPath("ffmpeg"); err != nil {
++		return encoderResult{}, fmt.Errorf("-hwaccel intel requires ffmpeg in PATH")
++	}
++	device := os.Getenv("DOUBLETAKE_VAAPI_DEVICE")
++	if device == "" {
++		device = findIntelRenderNode()
++	}
++	if device == "" {
++		return encoderResult{}, fmt.Errorf("-hwaccel intel found no i915 render node; set DOUBLETAKE_VAAPI_DEVICE")
++	}
++	if announce {
++		log.Printf("[CAPTURE] using ffmpeg VA-API hardware encoding (h264_vaapi on %s)", device)
++	}
++	return encoderResult{
++		rawFormat: "I420",
++		codec:     VideoCodecH264,
++		ffmpegEncode: &ffmpegVAAPIEncoder{
++			device:           device,
++			bitrateKbps:      bitrate,
++			keyframeInterval: keyframeInterval,
++		},
++	}, nil
++}
++
++func findIntelRenderNode() string {
++	nodes, _ := filepath.Glob("/sys/class/drm/renderD*")
++	for _, node := range nodes {
++		driver, err := os.Readlink(filepath.Join(node, "device", "driver"))
++		if err == nil && filepath.Base(driver) == "i915" {
++			return "/dev/dri/" + filepath.Base(node)
++		}
++	}
++	return ""
++}
++
++// newVideoCaptureCommand runs gstArgs directly, or for an ffmpeg encoder splits
++// them into capture | ffmpeg | packetize under bash. Inherited ExtraFiles (the
++// PipeWire fd) reach the first stage unchanged. Each stage gets a parent-death
++// SIGKILL, because a VA-API encoder blocked in the driver ignores EOF/EPIPE
++// and would otherwise outlive the stream.
++func newVideoCaptureCommand(ctx context.Context, gstArgs []string, encoder encoderResult, maxWidth, maxHeight int) *exec.Cmd {
++	if encoder.ffmpegEncode == nil {
++		return exec.CommandContext(ctx, "gst-launch-1.0", gstArgs...)
++	}
++	split := -1
++	for i, arg := range gstArgs {
++		if arg == ffmpegPipelineSplit {
++			split = i
++			break
++		}
++	}
++	if split < 1 {
++		panic("ffmpeg encoder pipeline is missing its split marker")
++	}
++	capture := append(append([]string{}, gstArgs[:split-1]...), "!", "fdsink", "fd=1", "sync=false")
++	packetize := append([]string{"--quiet", "fdsrc", "fd=0", "do-timestamp=true"}, gstArgs[split+1:]...)
++
++	stage := func(name string, args []string) string {
++		return shellJoin(append([]string{"setpriv", "--pdeathsig", "KILL", name}, args...))
++	}
++	script := "set -o pipefail; " +
++		stage("gst-launch-1.0", capture) + " | " +
++		stage("ffmpeg", encoder.ffmpegEncode.args(maxWidth, maxHeight)) + " | " +
++		stage("gst-launch-1.0", packetize)
++	dbg("[CAPTURE] ffmpeg pipeline: %s", script)
++	return exec.CommandContext(ctx, "bash", "-c", script)
++}
++
++func (e *ffmpegVAAPIEncoder) args(maxWidth, maxHeight int) []string {
++	// Fit and pad on the GPU. Keeping the capture's native pixels (padding rather
++	// than upscaling) keeps text sharp and leaves final scaling to the receiver.
++	filter := "hwupload,scale_vaapi=format=nv12"
++	if maxWidth > 0 && maxHeight > 0 {
++		w, h := maxWidth&^1, maxHeight&^1
++		filter = fmt.Sprintf("hwupload,scale_vaapi=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12,pad_vaapi=w=%d:h=%d:x=-1:y=-1", w, h, w, h)
++	}
++	// DOUBLETAKE_FFMPEG_ASYNC_DEPTH: frames the encoder may hold in flight.
++	// 1 hands each frame out as soon as it is encoded (ffmpeg's default is 2).
++	asyncDepth := "1"
++	if v := os.Getenv("DOUBLETAKE_FFMPEG_ASYNC_DEPTH"); v != "" {
++		asyncDepth = v
++	}
++	return []string{
++		"-hide_banner", "-loglevel", "warning", "-nostdin",
++		"-fflags", "nobuffer", "-f", "yuv4mpegpipe", "-i", "-",
++		"-vaapi_device", e.device, "-vf", filter,
++		"-c:v", "h264_vaapi", "-async_depth", asyncDepth, "-rc_mode", "CBR",
++		// A rate-control buffer of 1/4 s bounds keyframe bursts; the default
++		// (maxrate, i.e. 1 s) lets them queue up on the network.
++		"-b:v", fmt.Sprintf("%dk", e.bitrateKbps), "-maxrate", fmt.Sprintf("%dk", e.bitrateKbps),
++		"-bufsize", fmt.Sprintf("%dk", max(e.bitrateKbps/4, 1)),
++		"-g", fmt.Sprintf("%d", e.keyframeInterval), "-bf", "0", "-aud", "1",
++		"-flush_packets", "1", "-f", "h264", "-",
++	}
++}
++
++func shellJoin(args []string) string {
++	quoted := make([]string, len(args))
++	for i, arg := range args {
++		quoted[i] = "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
++	}
++	return strings.Join(quoted, " ")
++}
++
++// wfRecorderPath returns DOUBLETAKE_WF_RECORDER: a wf-recorder built with
++// cross-device DMA-BUF support. When set, Wayland capture bypasses the portal
++// and PipeWire: wf-recorder takes damage-only wlr-screencopy frames into a
++// LINEAR buffer on the Intel GPU (the compositor GPU renders into it), then
++// VA-API converts, pads and encodes there. No pixel work touches the CPU.
++func wfRecorderPath() string {
++	return os.Getenv("DOUBLETAKE_WF_RECORDER")
++}
++
++func startWfRecorderCapture(ctx context.Context, cfg CaptureConfig, encoder encoderResult, timestampedOutput bool) (*ScreenCapture, error) {
++	if encoder.ffmpegEncode == nil {
++		return nil, fmt.Errorf("wf-recorder capture requires -hwaccel intel")
++	}
++	captureCtx, cancel := context.WithCancel(ctx)
++	e := encoder.ffmpegEncode
++
++	// Fit to the canvas, pad while still RGB, then convert: pad_vaapi on NV12
++	// fills the bars with zero YUV, which is green, and pad alone cannot shrink
++	// a screen larger than the canvas (e.g. 2880x1800 into 1920x1080).
++	// DOUBLETAKE_NO_PAD=1 when the captured output is already the canvas size
++	// (raytube's TV desktop): the pad pass is a full-frame GPU copy that does
++	// nothing but costs CPU and drops frames.
++	filter := "scale_vaapi=format=nv12"
++	if cfg.MaxWidth > 0 && cfg.MaxHeight > 0 && os.Getenv("DOUBLETAKE_NO_PAD") == "" {
++		w, h := cfg.MaxWidth&^1, cfg.MaxHeight&^1
++		filter = fmt.Sprintf("scale_vaapi=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2,pad_vaapi=w=%d:h=%d:x=-1:y=-1:color=black,scale_vaapi=format=nv12", w, h, w, h)
++	}
++	fps := cfg.FPS
++	if fps <= 0 {
++		fps = 30
++	}
++	asyncDepth := "1"
++	if v := os.Getenv("DOUBLETAKE_FFMPEG_ASYNC_DEPTH"); v != "" {
++		asyncDepth = v
++	}
++	wfArgs := []string{
++		"-c", "h264_vaapi", "-d", e.device, "-F", filter,
++		// -B gives the encoder the real frame rate (without it VA-API rate
++		// control assumes ~65535 fps and starves every frame) and caps the
++		// damage-driven capture rate to match.
++		"-B", fmt.Sprintf("%d", fps),
++		// VBR with 2x peaks and a 1 s buffer: screen changes are bursty, and a
++		// tight CBR buffer makes i965 BRC "underflow" and smear until the next IDR.
++		"-p", "rc_mode=VBR",
++		"-p", fmt.Sprintf("b=%dk", e.bitrateKbps), "-p", fmt.Sprintf("maxrate=%dk", 2*e.bitrateKbps),
++		"-p", fmt.Sprintf("bufsize=%dk", 2*e.bitrateKbps),
++		"-p", fmt.Sprintf("g=%d", e.keyframeInterval), "-p", "bf=0",
++		"-p", "async_depth=" + asyncDepth, "-p", "aud=1",
++		"-m", "h264", "-f", "pipe:1",
++	}
++	// DOUBLETAKE_WF_ARGS appends wf-recorder options, e.g. "-D" to capture
++	// every compositor frame (capped at -B) instead of damage-only.
++	wfArgs = append(wfArgs, strings.Fields(os.Getenv("DOUBLETAKE_WF_ARGS"))...)
++	packetize := []string{"--quiet", "fdsrc", "fd=0", "do-timestamp=true"}
++	for _, stage := range packetizeStages(encoder.codec, timestampedOutput) {
++		packetize = append(packetize, "!")
++		packetize = append(packetize, stage...)
++	}
++	stage := func(name string, args []string) string {
++		return shellJoin(append([]string{"setpriv", "--pdeathsig", "KILL", name}, args...))
++	}
++	script := "set -o pipefail; " + stage(wfRecorderPath(), wfArgs) + " | " + stage("gst-launch-1.0", packetize)
++	log.Printf("[CAPTURE] using wf-recorder screencopy capture (zero-copy DMA-BUF, VA-API on %s)", e.device)
++	dbg("[CAPTURE] wf-recorder pipeline: %s", script)
++
++	cmd := exec.CommandContext(captureCtx, "bash", "-c", script)
++	cmd.Env = append(os.Environ(), "WF_FORCE_DMABUF=1", "WF_IMPLICIT_MODIFIER=1")
++	stdout, err := cmd.StdoutPipe()
++	if err != nil {
++		cancel()
++		return nil, fmt.Errorf("wf-recorder stdout pipe: %w", err)
++	}
++	stderr, _ := cmd.StderrPipe()
++	waitResult, err := startGStreamerCommand(cmd)
++	if err != nil {
++		cancel()
++		return nil, fmt.Errorf("start wf-recorder: %w", err)
++	}
++	go logStderr("WF", stderr)
++
++	capture := &ScreenCapture{
++		cmd:    cmd,
++		stdout: stdout,
++		cancel: cancel,
++		waitCh: make(chan struct{}),
++	}
++	if timestampedOutput {
++		capture.frames = newRTPVideoAccessUnitReader(stdout, encoder.codec)
++	}
++	go func() {
++		capture.waitErr = <-waitResult
++		close(capture.waitCh)
++	}()
++	return capture, nil
++}
+diff --git i/internal/airplay/mirror.go w/internal/airplay/mirror.go
+index 1784951..d4c08ec 100644
+--- i/internal/airplay/mirror.go
++++ w/internal/airplay/mirror.go
+@@ -125,9 +125,13 @@ func (c *mediaClock) reanchor(headers map[string]string, receivedAt time.Time) e
+ 	// same continuous timeline instead of relying on video-only packet clamping.
+ 	if !c.anchorLocal.IsZero() && !receivedAt.Before(c.anchorLocal) {
+ 		projected := c.anchorTimestamp + compactTimestamp(receivedAt.Sub(c.anchorLocal))
++		sample := anchorTimestamp
+ 		if anchorTimestamp < projected {
+ 			anchorTimestamp = projected
+ 		}
++		dbg("[PTP] reanchor wall=%s timeline=%.6f sample-projected=%+.1fms",
++			receivedAt.Format("15:04:05.000000"), float64(anchorTimestamp)/(1<<32),
++			(float64(sample)-float64(projected))/(1<<32)*1000)
+ 	}
+ 	c.anchorTimestamp = anchorTimestamp
+ 	c.anchorLocal = receivedAt
+@@ -1513,6 +1517,35 @@ func hasStartCode(b []byte) bool {
+ }
+ 
+ func findStartCode(b []byte, from int) int {
++	if from < 0 {
++		from = 0
++	}
++	// Jump between 0x01 bytes with the vectorised IndexByte and look back for
++	// the zeros, instead of testing every byte: 1080p/1440p access units are
++	// hundreds of KB with only a handful of start codes. Same results as
++	// findStartCodeBytewise, including ignoring a 3-byte code in the last byte.
++	for i := from + 2; i < len(b); {
++		j := bytes.IndexByte(b[i:], 0x01)
++		if j < 0 {
++			return -1
++		}
++		k := i + j
++		if b[k-1] == 0x00 && b[k-2] == 0x00 {
++			if k-3 >= from && b[k-3] == 0x00 {
++				return k - 3
++			}
++			if k+1 < len(b) {
++				return k - 2
++			}
++		}
++		i = k + 1
++	}
++	return -1
++}
++
++// findStartCodeBytewise is the original byte-at-a-time scan, kept as the
++// reference for tests of findStartCode.
++func findStartCodeBytewise(b []byte, from int) int {
+ 	if from < 0 {
+ 		from = 0
+ 	}
+diff --git i/internal/airplay/startcode_test.go w/internal/airplay/startcode_test.go
+new file mode 100644
+index 0000000..c309959
+--- /dev/null
++++ w/internal/airplay/startcode_test.go
+@@ -0,0 +1,51 @@
++package airplay
++
++import (
++	"math/rand"
++	"testing"
++)
++
++// findStartCode must match the original byte-at-a-time scan exactly.
++func TestFindStartCodeMatchesBytewise(t *testing.T) {
++	r := rand.New(rand.NewSource(1))
++	for n := 0; n < 1_000_000; n++ {
++		b := make([]byte, r.Intn(24))
++		for i := range b {
++			// Mostly 0x00 and 0x01 so start codes and near misses are common.
++			switch r.Intn(4) {
++			case 0, 1:
++				b[i] = 0x00
++			case 2:
++				b[i] = 0x01
++			default:
++				b[i] = byte(r.Intn(256))
++			}
++		}
++		from := r.Intn(len(b)+3) - 2
++		if got, want := findStartCode(b, from), findStartCodeBytewise(b, from); got != want {
++			t.Fatalf("findStartCode(% x, %d) = %d, want %d", b, from, got, want)
++		}
++	}
++}
++
++func BenchmarkFindStartCode(b *testing.B) {
++	data := make([]byte, 300_000) // a typical 1440p access unit
++	rand.New(rand.NewSource(2)).Read(data)
++	for i := range data {
++		if data[i] == 0x01 && i >= 2 && data[i-1] == 0 && data[i-2] == 0 {
++			data[i] = 0x02 // no accidental start codes in the payload
++		}
++	}
++	copy(data[0:], []byte{0, 0, 0, 1})
++	b.Run("vectorised", func(b *testing.B) {
++		for i := 0; i < b.N; i++ {
++			_ = splitAnnexBAccessUnit(data)
++		}
++	})
++	b.Run("bytewise", func(b *testing.B) {
++		for i := 0; i < b.N; i++ {
++			for s := findStartCodeBytewise(data, 0); s >= 0; s = findStartCodeBytewise(data, s+3) {
++			}
++		}
++	})
++}

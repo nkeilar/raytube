@@ -1,0 +1,331 @@
+diff --git i/src/frame-writer.cpp w/src/frame-writer.cpp
+index 34d16d6..70664ab 100644
+--- i/src/frame-writer.cpp
++++ w/src/frame-writer.cpp
+@@ -192,21 +192,23 @@ AVPixelFormat FrameWriter::handle_buffersink_pix_fmt(const AVCodec *codec)
+     auto in_fmt = get_input_format();
+ 
+     /* For codecs such as rawvideo no supported formats are listed */
+-    if (!codec->pix_fmts)
++    const AVPixelFormat* codec_pix_fmts = nullptr;
++    avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, (const void**)&codec_pix_fmts, nullptr);
++    if (!codec_pix_fmts)
+         return in_fmt;
+ 
+     /* If the codec supports getting the appropriate RGB format
+      * directly, we want to use it since we don't have to convert data */
+-    if (is_fmt_supported(in_fmt, codec->pix_fmts))
++    if (is_fmt_supported(in_fmt, codec_pix_fmts))
+         return in_fmt;
+ 
+     /* Choose the format supported by the codec which best approximates the
+      * input fmt. */
+     AVPixelFormat best_format = AV_PIX_FMT_NONE;
+-    for (int i = 0; codec->pix_fmts[i] != AV_PIX_FMT_NONE; i++) {
++    for (int i = 0; codec_pix_fmts[i] != AV_PIX_FMT_NONE; i++) {
+         int loss = 0;
+         best_format = av_find_best_pix_fmt_of_2(best_format,
+-            codec->pix_fmts[i], in_fmt, false, &loss);
++            codec_pix_fmts[i], in_fmt, false, &loss);
+     }
+     return best_format;
+ }
+@@ -438,7 +440,11 @@ void FrameWriter::init_video_filters(const AVCodec *codec)
+     this->videoCodecCtx->height = filter_output->h;
+     this->videoCodecCtx->pix_fmt = (AVPixelFormat)filter_output->format;
+     this->videoCodecCtx->time_base = filter_output->time_base;
+-    this->videoCodecCtx->framerate = AVRational{1,0};
++    // With no frame rate, VA-API rate control falls back to the 1/1000000
++    // time base (clamped to 65535 fps) and budgets ~nothing per frame, so
++    // CBR/VBR output is starved and blocky. Use the declared buffer rate.
++    this->videoCodecCtx->framerate = params.buffrate > 0 ?
++        AVRational{params.buffrate, 1} : AVRational{1,0};
+     this->videoCodecCtx->sample_aspect_ratio = filter_output->sample_aspect_ratio;
+ 
+     this->hw_frame_context = av_buffersink_get_hw_frames_ctx(
+@@ -517,16 +523,18 @@ void FrameWriter::init_video_stream()
+ static uint64_t get_codec_channel_layout(const AVCodec *codec)
+ {
+     int i = 0;
+-    if (!codec->ch_layouts)
++    const AVChannelLayout *codec_ch_layouts = nullptr;
++    avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_CHANNEL_LAYOUT, 0, (const void**)&codec_ch_layouts, nullptr);
++    if (!codec_ch_layouts)
+         return AV_CH_LAYOUT_STEREO;
+     while (1) {
+-        if (!av_channel_layout_check(&codec->ch_layouts[i]))
++        if (!av_channel_layout_check(&codec_ch_layouts[i]))
+             break;
+-        if (codec->ch_layouts[i].u.mask == AV_CH_LAYOUT_STEREO)
+-            return codec->ch_layouts[i].u.mask;
++        if (codec_ch_layouts[i].u.mask == AV_CH_LAYOUT_STEREO)
++            return codec_ch_layouts[i].u.mask;
+         i++;
+     }
+-    return codec->ch_layouts[0].u.mask;
++    return codec_ch_layouts[0].u.mask;
+ }
+ #else
+ static uint64_t get_codec_channel_layout(const AVCodec *codec)
+@@ -548,20 +556,24 @@ static uint64_t get_codec_channel_layout(const AVCodec *codec)
+ static enum AVSampleFormat get_codec_auto_sample_fmt(const AVCodec *codec)
+ {
+     int i = 0;
+-    if (!codec->sample_fmts)
++    const AVSampleFormat *codec_sample_fmts = nullptr;
++    avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, (const void**)&codec_sample_fmts, nullptr);
++    if (!codec_sample_fmts)
+         return av_get_sample_fmt(FALLBACK_AUDIO_SAMPLE_FMT);
+     while (1) {
+-        if (codec->sample_fmts[i] == -1)
++        if (codec_sample_fmts[i] == -1)
+             break;
+-        if (av_get_bytes_per_sample(codec->sample_fmts[i]) >= 2)
+-            return codec->sample_fmts[i];
++        if (av_get_bytes_per_sample(codec_sample_fmts[i]) >= 2)
++            return codec_sample_fmts[i];
+         i++;
+     }
+-    return codec->sample_fmts[0];
++    return codec_sample_fmts[0];
+ }
+ 
+ bool check_fmt_available(const AVCodec *codec, AVSampleFormat fmt){
+-    for (const enum AVSampleFormat *sample_ptr = codec -> sample_fmts; *sample_ptr != -1; sample_ptr++)
++    const AVSampleFormat *codec_sample_fmts = nullptr;
++    avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, (const void**)&codec_sample_fmts, nullptr);
++    for (const enum AVSampleFormat *sample_ptr = codec_sample_fmts; *sample_ptr != -1; sample_ptr++)
+     {
+         if (*sample_ptr == fmt)
+         {
+@@ -574,11 +586,13 @@ bool check_fmt_available(const AVCodec *codec, AVSampleFormat fmt){
+ static enum AVSampleFormat convert_codec_sample_fmt(const AVCodec *codec, std::string requested_fmt)
+ {
+     static enum AVSampleFormat converted_fmt = av_get_sample_fmt(requested_fmt.c_str());
++    const AVSampleFormat *codec_sample_fmts = nullptr;
++    avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, (const void**)&codec_sample_fmts, nullptr);
+     if (converted_fmt == AV_SAMPLE_FMT_NONE)
+     {
+         std::cerr << "Failed to find the given sample format: " << requested_fmt << std::endl;
+         std::exit(-1);
+-    } else if (!codec->sample_fmts || check_fmt_available(codec, converted_fmt))
++    } else if (!codec_sample_fmts || check_fmt_available(codec, converted_fmt))
+     {
+         std::cerr << "Using sample format " << av_get_sample_fmt_name(converted_fmt) << " for audio codec " << codec->name << std::endl;
+         return converted_fmt;
+@@ -811,6 +825,13 @@ bool FrameWriter::push_frame(AVFrame *frame, int64_t usec)
+         pkt->size = 0;
+ 
+         encode(videoCodecCtx, filtered_frame, pkt);
++        if (!last_filtered) {
++            last_filtered = av_frame_alloc();
++        }
++        if (last_filtered) {
++            av_frame_unref(last_filtered);
++            av_frame_ref(last_filtered, filtered_frame);
++        }
+         av_frame_free(&filtered_frame);
+         av_packet_free(&pkt);
+     }
+@@ -819,6 +840,24 @@ bool FrameWriter::push_frame(AVFrame *frame, int64_t usec)
+     return true;
+ }
+ 
++bool FrameWriter::repeat_last_frame(int64_t usec)
++{
++    if (!last_filtered || !last_filtered->buf[0]) {
++        return true;
++    }
++    AVFrame *again = av_frame_clone(last_filtered);
++    if (!again) {
++        return false;
++    }
++    again->pts = usec;
++    again->pict_type = AV_PICTURE_TYPE_NONE;
++    AVPacket *pkt = av_packet_alloc();
++    encode(videoCodecCtx, again, pkt);
++    av_frame_free(&again);
++    av_packet_free(&pkt);
++    return true;
++}
++
+ bool FrameWriter::add_frame(const uint8_t* pixels, int64_t usec, bool y_invert)
+ {
+     /* Calculate data after y-inversion */
+@@ -1016,6 +1055,8 @@ void FrameWriter::finish_frame(AVCodecContext *enc_ctx, AVPacket& pkt)
+ 
+ FrameWriter::~FrameWriter()
+ {
++    // Release the repeat frame before its GPU surface pool goes away.
++    av_frame_free(&last_filtered);
+     // Writing the delayed frames:
+     AVPacket *pkt = av_packet_alloc();
+ 
+diff --git i/src/frame-writer.hpp w/src/frame-writer.hpp
+index a1dce90..50190c4 100644
+--- i/src/frame-writer.hpp
++++ w/src/frame-writer.hpp
+@@ -122,11 +122,17 @@ class FrameWriter
+ #endif
+     void finish_frame(AVCodecContext *enc_ctx, AVPacket& pkt);
+     bool push_frame(AVFrame *frame, int64_t usec);
++    // Last frame out of the filtergraph (already on the GPU, encoder format),
++    // kept so repeat_last_frame() can encode it again.
++    AVFrame *last_filtered = nullptr;
+ 
+   public:
+     FrameWriter(const FrameWriterParams& params);
+     bool add_frame(const uint8_t* pixels, int64_t usec, bool y_invert);
+     bool add_frame(struct gbm_bo *bo, int64_t usec, bool y_invert);
++    /* Encode the last frame again at usec, for receivers that only show a frame
++     * once the next one arrives. Returns true if there was nothing to repeat. */
++    bool repeat_last_frame(int64_t usec);
+ 
+ #ifdef HAVE_AUDIO
+     /* Buffer must have size get_audio_buffer_size() */
+diff --git i/src/main.cpp w/src/main.cpp
+index 8ff65f9..28a0d14 100644
+--- i/src/main.cpp
++++ w/src/main.cpp
+@@ -336,8 +336,15 @@ static void frame_handle_ready(void *, struct zwlr_screencopy_frame_v1 *,
+ static void frame_handle_failed(void *, struct zwlr_screencopy_frame_v1 *) {
+     std::cerr << "Failed to copy frame, retrying..." << std::endl;
+     ++frame_failed_cnt;
++    // Ride out transient refusals (window/fullscreen transitions) instead of
++    // exiting after a burst: back off up to 200 ms, allow ~WF_MAX_FAILURES.
++    static const int max_failures = getenv("WF_MAX_FAILURES") ?
++        atoi(getenv("WF_MAX_FAILURES")) : MAX_FRAME_FAILURES;
++    if (max_failures > MAX_FRAME_FAILURES)
++        std::this_thread::sleep_for(std::chrono::milliseconds(
++            std::min(200, 10 * frame_failed_cnt)));
+     request_next_frame();
+-    if (frame_failed_cnt > MAX_FRAME_FAILURES)
++    if (frame_failed_cnt > max_failures)
+     {
+         std::cerr << "Failed to copy frame too many times, exiting!" << std::endl;
+         exit_main_loop = true;
+@@ -430,6 +437,14 @@ static void frame_handle_linux_dmabuf(void *, struct zwlr_screencopy_frame_v1 *f
+         buffer.params = zwp_linux_dmabuf_v1_create_params(dmabuf);
+ 
+         uint64_t mod = gbm_bo_get_modifier(buffer.bo);
++        // WF_IMPLICIT_MODIFIER=1: advertise the linear bo with an implicit
++        // modifier. Pre-GFX9 AMD (e.g. GCN 1.0) compositors list only implicit
++        // modifiers and reject an explicit LINEAR pair from another GPU.
++        if (getenv("WF_IMPLICIT_MODIFIER") && mod == 0)
++            mod = 0x00ffffffffffffffULL; // DRM_FORMAT_MOD_INVALID
++        if (getenv("WF_DEBUG_BO"))
++            fprintf(stderr, "dmabuf bo: %ux%u fourcc=%.4s modifier=0x%016llx stride=%u\n",
++                buffer.width, buffer.height, (char*)&format, (unsigned long long)mod, buffer.stride);
+         zwp_linux_buffer_params_v1_add(buffer.params,
+             gbm_bo_get_fd(buffer.bo), 0,
+             gbm_bo_get_offset(buffer.bo, 0),
+@@ -629,10 +644,38 @@ static void write_loop(FrameWriterParams params)
+ 
+     std::optional<uint64_t> first_frame_ts;
+ 
++    // WF_REPEAT_FRAMES=1 with --buffrate: when the compositor sends no new frame
++    // for one frame interval (it only redraws a headless output on damage),
++    // encode the last frame again. AirPlay and Cast receivers show a frame only
++    // once the next arrives, so a still screen would otherwise lag and let the
++    // receiver grow its video buffer while audio stays on time.
++    const bool repeat_frames = getenv("WF_REPEAT_FRAMES") && params.buffrate > 0;
++    const uint64_t frame_interval_usec = params.buffrate > 0 ? 1000000ull / params.buffrate : 0;
++    uint64_t last_sent_usec = 0;
++    auto monotonic_usec = [] {
++        timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        return (uint64_t)ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
++    };
++
+     while(!exit_main_loop)
+     {
+         // wait for frame to become available
+         while(buffers.encode().ready_encode() != true && !exit_main_loop) {
++            if (repeat_frames && last_sent_usec && first_frame_ts.has_value() &&
++                monotonic_usec() - last_sent_usec >= frame_interval_usec) {
++                uint64_t now = monotonic_usec();
++                std::lock_guard<std::mutex> lock(frame_writer_mutex);
++                if (frame_writer && !frame_writer->repeat_last_frame(now - first_frame_ts.value())) {
++                    break;
++                }
++                last_sent_usec = now;
++                if (getenv("WF_DEBUG_REPEAT")) {
++                    static int repeats = 0;
++                    if (++repeats % 30 == 1) std::cerr << "repeat-debug: repeats=" << repeats << std::endl;
++                }
++                continue;
++            }
+             std::this_thread::sleep_for(std::chrono::microseconds(1000));
+         }
+         if (exit_main_loop) {
+@@ -671,6 +714,16 @@ static void write_loop(FrameWriterParams params)
+ 
+         bool drop = false;
+         uint64_t sync_timestamp = 0;
++
++        // With --buffrate, also cap the damage-driven capture rate so a 60 Hz
++        // compositor cannot feed the encoder more frames than it budgets for.
++        static uint64_t last_kept_usec = 0;
++        if (params.buffrate > 0 && last_kept_usec &&
++            buffer.base_usec - last_kept_usec < 1000000ull / params.buffrate * 9 / 10) {
++            drop = true;
++        } else {
++            last_kept_usec = buffer.base_usec;
++        }
+         if (first_frame_ts.has_value()) {
+             sync_timestamp = buffer.base_usec - first_frame_ts.value();
+ #ifdef HAVE_AUDIO
+@@ -689,6 +742,12 @@ static void write_loop(FrameWriterParams params)
+ 
+         bool do_cont = false;
+ 
++        if (!drop && use_dmabuf && !buffer.bo) {
++            // No DMA-BUF was attached to this slot (capture not completed);
++            // skip it rather than dereference a null bo.
++            drop = true;
++        }
++
+         if (!drop) {
+             if (use_dmabuf) {
+                 if (use_hwupload) {
+@@ -717,6 +776,14 @@ static void write_loop(FrameWriterParams params)
+ 
+         frame_writer_mutex.unlock();
+ 
++        if (!drop) {
++            last_sent_usec = monotonic_usec();
++            static int dbg_n = 0;
++            if (repeat_frames && getenv("WF_DEBUG_REPEAT") && dbg_n++ < 3)
++                std::cerr << "repeat-debug: base_usec=" << buffer.base_usec << " monotonic=" << last_sent_usec
++                          << " first=" << (first_frame_ts ? *first_frame_ts : 0) << " interval=" << frame_interval_usec << std::endl;
++        }
++
+         if (!do_cont) {
+             break;
+         }
+@@ -1262,7 +1329,11 @@ int main(int argc, char *argv[])
+         }
+ 
+         // check we use same device as compositor
+-        if (!params.hw_device.empty() && params.hw_device == drm_device_name && !force_no_dmabuf)
++        // WF_FORCE_DMABUF=1: keep DMA-BUF when the encoder is a different GPU
++        // (e.g. AMD display, Intel VA-API encode). Buffers are allocated LINEAR
++        // on the encode device, which the compositor GPU can render into.
++        const bool force_cross_device = getenv("WF_FORCE_DMABUF") != nullptr;
++        if (!params.hw_device.empty() && (params.hw_device == drm_device_name || force_cross_device) && !force_no_dmabuf)
+         {
+             use_dmabuf = true;
+         } else if (force_no_dmabuf) {
+@@ -1290,7 +1361,11 @@ int main(int argc, char *argv[])
+         {
+             std::cerr << "enabled DMA-BUF capture, device " << params.hw_device.c_str() << std::endl;
+ 
+-            drm_fd = open(params.hw_device.c_str(), O_RDWR);
++            // WF_ALLOC_DEVICE: allocate capture buffers on another GPU than the
++            // encoder (e.g. the compositor's GPU, so it renders into local
++            // memory and the encoder imports the linear buffer instead).
++            const char *alloc_dev = getenv("WF_ALLOC_DEVICE");
++            drm_fd = open(alloc_dev ? alloc_dev : params.hw_device.c_str(), O_RDWR);
+             if (drm_fd < 0)
+             {
+                 fprintf(stderr, "failed to open drm device: %m\n");

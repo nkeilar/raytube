@@ -1,0 +1,9 @@
+// Optional: add raytube to the Omarchy menu. Merge these keys into
+// ~/.config/omarchy/extensions/omarchy-menu.jsonc (the Cast menu in the bar
+// comes from the omarchy-raytube plugin; this is a keyboard-menu shortcut).
+{
+  "raytube": {"icon": "󰄙", "label": "Cast", "description": "raytube: cast the screen or the TV desktop"},
+  "raytube.resync": {"icon": "󰑓", "label": "Re-sync TV", "action": "raytube-cast resync", "when": "raytube-cast status | grep -q ^on"},
+  "raytube.stop": {"icon": "󰅙", "label": "Stop casting", "action": "raytube-cast stop", "when": "raytube-cast status | grep -q ^on"},
+  "raytube.tv": {"icon": "󰍹", "label": "TV desktop on/off (last TV)", "action": "raytube-cast tv"}
+}

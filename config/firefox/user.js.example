@@ -1,0 +1,10 @@
+// Firefox hardware video decoding on the Intel GPU, for videos played on the
+// TV desktop (raytube-tv browser) or anywhere else. Copy these lines into your
+// profile's user.js (about:profiles shows the folder) and restart Firefox.
+// Pair with config/firefox/60-firefox-intel-decode.conf.example.
+user_pref("media.ffmpeg.vaapi.enabled", true);
+user_pref("media.hardware-video-decoding.force-enabled", true);
+// Intel Haswell-era GPUs decode only H.264 in hardware: make YouTube and other
+// sites serve it instead of VP9/AV1, which would otherwise be decoded on the CPU.
+user_pref("media.av1.enabled", false);
+user_pref("media.mediasource.vp9.enabled", false);

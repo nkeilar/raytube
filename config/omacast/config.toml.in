@@ -1,0 +1,11 @@
+# omacast (Chromecast sender) settings for raytube. install.sh renders this to
+# ~/.config/omacast/config.toml, filling in @RAYTUBE_DIR@.
+# device: your Chromecast's name as shown by `raytube-cast list` (raytube-cast
+# passes it on the command line, so this is only the default).
+device = ""
+preset = "balanced"          # 1920x1080 @ 30 fps
+video_bitrate_kbps = 8000
+audio = true
+# Video comes from raytube's zero-copy capture (patched wf-recorder, Intel VA-API).
+# It captures the TV desktop when RAYTUBE_OUTPUT is set, else the screen.
+video_command = ["@RAYTUBE_DIR@/wf-capture.sh", "{width}", "{height}", "{fps}", "{kbps}"]

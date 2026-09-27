@@ -1,0 +1,30 @@
+# Private working notes, session transcripts and assistant config
+.agent/
+.claude/
+CLAUDE.md
+FUCKUPS.md
+bin/
+prompt.txt
+ping_keepalive.sh
+user-commands/
+user-skills/
+mcp-*.log
+
+# Your own family board data (board/data.example.js ships instead)
+board/data.js
+
+# Upstream sources and builds (scripts/fetch-upstreams.sh, build-upstreams.sh)
+build/
+project-references/
+references
+
+# Leftovers
+*.bak
+*.bak.*
+*.orig
+*.new
+__pycache__/
+*.log
+
+# Early design mockups (contain personal examples)
+design/

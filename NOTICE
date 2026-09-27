@@ -1,0 +1,27 @@
+raytube is MIT-licensed (see LICENSE), except where noted below.
+
+Third-party code and patches
+----------------------------
+
+patches/doubletake.patch
+    Changes to doubletake (https://github.com/omarroth/doubletake), an AirPlay 2
+    sender licensed LGPL-3.0-or-later. This patch is a derivative of doubletake
+    and is likewise licensed LGPL-3.0-or-later. scripts/fetch-upstreams.sh
+    downloads the upstream source at the commit in patches/BASES.txt and applies
+    the patch; a doubletake binary built from it is covered by the LGPL, whose
+    source is that commit plus this patch.
+
+patches/wf-recorder.patch
+    Changes to wf-recorder (https://github.com/ammen99/wf-recorder), MIT licence,
+    Copyright (c) 2019 Ilia Bozhinov. The patch is under the same MIT licence.
+
+patches/omacast.patch
+    Changes to omacast (https://github.com/Aphrodine-wq/omacast), MIT licence,
+    Copyright (c) 2026 James Burge. The patch is under the same MIT licence.
+
+board/vendor/three.min.js
+    three.js r128 (https://threejs.org), MIT licence, Copyright 2010-2021
+    three.js authors. Included unmodified.
+
+Built with help from the open reverse-engineering work behind UxPlay, pyatv,
+shairport-sync, openscreen and the unofficial AirPlay specification.

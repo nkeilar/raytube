@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AV Sync Test</title>
+<style>
+  /* Flash and beep at the same instant; judge on the TV whether sound leads or lags. */
+  html, body { margin: 0; height: 100%; background: #0b0c10; color: #e8e6df; font: 2.2vw/1.4 system-ui, sans-serif; overflow: hidden; }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; }
+  #flash.on { opacity: 1; }
+  .ui { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; }
+  .ui b { display: block; font-size: 4vw; }
+  .ui small { color: #9aa0b6; }
+  #count { font: 700 12vw/1 ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<div id="flash"></div>
+<div class="ui">
+  <div>
+    <b>Does the beep come before, with, or after the flash?</b>
+    <div id="count">–</div>
+    <small id="hint">Click anywhere to start the sound</small>
+  </div>
+</div>
+<script>
+  // Every PERIOD ms: a full-screen white flash for one frame-ish (100 ms) and a
+  // 50 ms 1 kHz beep, both scheduled for the same audio-clock instant.
+  const PERIOD = 4000;  // long enough that a lead or lag of up to ~2 s is unambiguous
+  let ctx, n = 0;
+  const flash = document.getElementById("flash");
+
+  function beepAt(t) {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = 1000;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.6, t + 0.002);
+    g.gain.setValueAtTime(0.6, t + 0.045);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
+    o.connect(g).connect(ctx.destination);
+    o.start(t); o.stop(t + 0.06);
+  }
+
+  function schedule() {
+    // Schedule the beep slightly ahead on the audio clock, and the flash for the
+    // same instant using the page clock and the context's output latency.
+    const lead = 0.25;
+    const t = ctx.currentTime + lead;
+    beepAt(t);
+    const out = (ctx.outputLatency || ctx.baseLatency || 0) * 1000;
+    setTimeout(() => {
+      flash.classList.add("on");
+      document.getElementById("count").textContent = ++n;
+      setTimeout(() => flash.classList.remove("on"), 100);
+    }, lead * 1000 + out);
+  }
+
+  let started = false;
+  function run() {
+    if (started || !ctx || ctx.state !== "running") return;
+    started = true;
+    document.getElementById("hint").textContent = "Watch the flash, listen for the beep";
+    schedule();
+    setInterval(schedule, PERIOD);
+  }
+  function start() {
+    // A new AudioContext starts "suspended" for a moment even when autoplay is
+    // allowed; wait for it to run rather than giving up.
+    if (!ctx) { ctx = new AudioContext({ latencyHint: "interactive" }); ctx.onstatechange = run; }
+    ctx.resume().then(run, () => {});
+  }
+  addEventListener("click", start);
+  addEventListener("keydown", start);
+  start();  // autoplay: the TV browser allows it; elsewhere a click starts it
+</script>
+</body>
+</html>

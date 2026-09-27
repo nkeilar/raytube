@@ -1,0 +1,249 @@
+#!/bin/bash
+# raytube-cast -- start/stop screen casting to AirPlay and Chromecast receivers (used by the Display panel).
+#
+#   raytube-cast list            one line per receiver: name<TAB>ip<TAB>paired|unpaired<TAB>airplay|cast
+#   raytube-cast status          "on<TAB>ip<TAB>name<TAB>mode" while casting, else "off"
+#   raytube-cast start <ip> [name]
+#   raytube-cast stop
+#   raytube-cast release         end the cast, keep the TV desktop
+#   raytube-cast toggle <ip> [name]   stop if casting to <ip>, else start it
+#   raytube-cast tv              toggle casting the TV desktop to the last-used
+#                                receiver (the TV desktop hotkey)
+#   raytube-cast mode [mirror|desktop] show or set what gets cast: the laptop
+#                                screen, or the virtual TV desktop (raytube-tv)
+#   raytube-cast resync          restart the session: sound and picture back in sync
+#   raytube-cast size <ip> [720p|1080p|1440p|WxH]   picture size for an Apple TV
+#                                (both modes; default 1080p; restarts a running cast)
+#   raytube-cast av-delay <ip> [ms]   show or set an Apple TV's sound delay (live)
+#   raytube-cast av-delay-step <+/-ms> nudge the current TV's sound delay (live)
+#
+# AirPlay receivers use cast-tv.sh (doubletake); Chromecasts use
+# cast-chromecast.sh (omacast, Cast Streaming). Either runs in the background
+# as the systemd user unit raytube-cast.service under the thermal guard. An
+# AirPlay receiver with no saved pairing opens a terminal instead, so its
+# on-screen PIN can be entered; once paired it works from the panel. A device
+# that speaks both (e.g. an LG TV) is listed once, as AirPlay.
+set -u
+
+DIR="$(dirname "$(readlink -f "$0")")"
+UNIT=raytube-cast
+STATE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/raytube-cast.target"
+MODE_FILE="$HOME/.local/state/raytube/mode"
+LAST_FILE="$HOME/.local/state/raytube/last-receiver"
+DELAY_DIR="$HOME/.config/raytube/av-delay"
+CREDS="$HOME/.config/doubletake/credentials.json"
+
+# AirPlay receivers on the LAN: name, IPv4 address, AirPlay device id.
+receivers() {
+	avahi-browse -rpt _airplay._tcp 2>/dev/null | awk -F';' '
+		$1 == "=" && $3 == "IPv4" {
+			id = ""
+			if (match($0, /"deviceid=[^"]*"/)) id = substr($0, RSTART + 10, RLENGTH - 11)
+			name = $4; gsub(/\\032/, " ", name)
+			print name "\t" $8 "\t" id
+		}' | sort -u
+}
+
+# Chromecasts: friendly name (TXT fn=, what omacast --to matches), IPv4.
+cast_receivers() {
+	avahi-browse -rpt _googlecast._tcp 2>/dev/null | awk -F';' '
+		$1 == "=" && $3 == "IPv4" {
+			name = ""
+			if (match($0, /"fn=[^"]*"/)) name = substr($0, RSTART + 4, RLENGTH - 5)
+			if (name != "") print name "\t" $8
+		}' | sort -u
+}
+
+is_paired() {
+	[ -n "$1" ] && [ -f "$CREDS" ] && grep -q "\"$1\"" "$CREDS"
+}
+
+casting() {
+	systemctl --user is-active --quiet "$UNIT"
+}
+
+cmd_list() {
+	local airplay
+	airplay=$(receivers)
+	while IFS=$'\t' read -r name ip id; do
+		[ -n "$ip" ] || continue
+		if is_paired "$id"; then p=paired; else p=unpaired; fi
+		printf '%s\t%s\t%s\tairplay\n' "$name" "$ip" "$p"
+	done <<<"$airplay"
+	cast_receivers | while IFS=$'\t' read -r name ip; do
+		grep -q $'\t'"$ip"$'\t' <<<"$airplay" && continue
+		printf '%s\t%s\tpaired\tcast\n' "$name" "$ip"
+	done
+}
+
+mode() {
+	local m
+	m=$(cat "$MODE_FILE" 2>/dev/null)
+	[ "$m" = desktop ] && echo desktop || echo mirror
+}
+
+cmd_mode() {
+	if [ -n "${1:-}" ]; then
+		case "$1" in mirror|desktop) ;; *) echo "mode is mirror or desktop" >&2; exit 2 ;; esac
+		local before
+		before=$(mode)
+		mkdir -p "$(dirname "$MODE_FILE")"
+		echo "$1" > "$MODE_FILE"
+		# Switching while casting restarts the cast to the same TV in the new mode.
+		if [ "$before" != "$1" ] && casting && [ -f "$STATE" ]; then
+			local ip name
+			IFS=$'\t' read -r ip name < "$STATE"
+			cmd_start "$ip" "$name" >/dev/null
+		fi
+	fi
+	mode
+}
+
+cmd_status() {
+	if casting && [ -f "$STATE" ]; then
+		printf 'on\t%s\t%s\n' "$(cat "$STATE")" "$(mode)"
+	else
+		echo off
+	fi
+}
+
+# Audio cycle while casting: the default 512 samples (10.7 ms) glitched under
+# load; 1024 (21 ms) did not. cast-watch.sh raises it to 2048 if glitches return.
+audio_quantum() {
+	if [ -n "${1:-}" ]; then pw-metadata -n settings 0 clock.force-quantum "$1" >/dev/null 2>&1
+	else pw-metadata -n settings -d 0 clock.force-quantum >/dev/null 2>&1; fi
+}
+
+cmd_stop() {
+	systemctl --user stop "$UNIT" 2>/dev/null
+	rm -f "$STATE"
+	audio_quantum
+	# The TV desktop only exists while it is being cast: bring its windows home.
+	"$DIR/raytube-tv" down
+}
+
+cmd_start() {
+	local ip=$1 name=${2:-$1} id kind
+	kind=$(cmd_list | awk -F'\t' -v ip="$ip" '$2 == ip { print $4; exit }')
+	casting && { systemctl --user stop "$UNIT" 2>/dev/null; rm -f "$STATE"; }
+	audio_quantum 1024
+	# The trouble watcher (glitches, auto re-sync) runs whenever we cast.
+	systemctl --user is-active --quiet raytube-watch ||
+		systemd-run --user --quiet --collect --unit=raytube-watch "$DIR/cast-watch.sh"
+	mkdir -p "$(dirname "$LAST_FILE")"; printf '%s\t%s\n' "$ip" "$name" > "$LAST_FILE"
+	# Desktop mode: cast the virtual TV desktop, sized for the receiver, with
+	# only the TV audio output's sound.
+	local env=()
+	if [ "$(mode)" = desktop ]; then
+		# Apple TVs keep sound and picture in sync at 720p and 1080p, but held a
+		# 2560x1440 picture ~0.9 s behind the sound. Per-TV choice (`size`):
+		# ~/.config/raytube/airplay-size/<ip>, default 1080p.
+		local size=1920x1080
+		[ "$kind" = airplay ] && size=$(airplay_size "$ip")
+		"$DIR/raytube-tv" up "$size"
+		env=(--setenv=RAYTUBE_OUTPUT=TV --setenv=OMACAST_AUDIO_MONITOR=raytube_tv.monitor
+			--setenv=CANVAS="$size" --setenv=WF_ARGS="-D -o TV" --setenv=DOUBLETAKE_NO_PAD=1
+			--setenv=PULSE_PROPS="device=raytube_tv.monitor buffer-time=60000 latency-time=20000")
+	else
+		"$DIR/raytube-tv" down
+		# Mirror mode: the laptop screen, fitted and padded to the chosen size.
+		# The old 3200x1800 canvas made the Apple TV hold the picture back too.
+		[ "$kind" = airplay ] && env=(--setenv=CANVAS="$(airplay_size "$ip")")
+	fi
+	if [ "$kind" = cast ]; then
+		printf '%s\t%s\n' "$ip" "$name" > "$STATE"
+		systemd-run --user --quiet --collect --unit="$UNIT" \
+			-p KillSignal=SIGINT -p TimeoutStopSec=15 -p CPUWeight=1000 "${env[@]}" \
+			--working-directory="$DIR" "$DIR/cast-chromecast.sh" "$name"
+		return
+	fi
+	id=$(receivers | awk -F'\t' -v ip="$ip" '$2 == ip { print $3; exit }')
+	if ! is_paired "$id"; then
+		# First connection needs the PIN shown on the receiver: run in a terminal.
+		setsid -f xdg-terminal-exec bash -c "echo 'Pairing with $name: type the PIN shown on the TV.'; TARGET='$ip' '$DIR/cast-tv.sh'; read -rp 'Cast ended. Press Enter to close'" >/dev/null 2>&1
+		return
+	fi
+	printf '%s\t%s\n' "$ip" "$name" > "$STATE"
+	# Per-TV audio delay (ms): the TV adds more delay to the picture than to the
+	# sound; tuned with av-sync-test.html and saved by `raytube-cast av-delay`.
+	local delay
+	delay=$(cat "$DELAY_DIR/$ip" 2>/dev/null)
+	systemd-run --user --quiet --collect --unit="$UNIT" \
+		-p KillSignal=SIGINT -p TimeoutStopSec=15 -p CPUWeight=1000 "${env[@]}" \
+		--setenv=TARGET="$ip" --setenv=AUDIO_DELAY_MS="${delay:-0}" \
+		--setenv=AUDIO_DELAY_FILE="$DELAY_DIR/$ip" --working-directory="$DIR" \
+		"$DIR/cast-tv.sh"
+}
+
+SIZE_DIR="$HOME/.config/raytube/airplay-size"
+airplay_size() { cat "$SIZE_DIR/$1" 2>/dev/null || echo 1920x1080; }
+
+# size <ip> [720p|1080p|1440p|WxH]: show or choose the picture size sent to an
+# AirPlay TV (both modes); a running cast to it restarts at the new size.
+cmd_size() {
+	local ip=$1 want=${2:-}
+	if [ -z "$want" ]; then airplay_size "$ip"; return; fi
+	case "$want" in 720p) want=1280x720 ;; 1080p) want=1920x1080 ;; 1440p) want=2560x1440 ;; esac
+	[[ "$want" =~ ^[0-9]+x[0-9]+$ ]] || { echo "size is 720p, 1080p, 1440p or WxH" >&2; return 2; }
+	mkdir -p "$SIZE_DIR"; echo "$want" > "$SIZE_DIR/$ip"
+	if casting && [ "$(cut -f1 "$STATE" 2>/dev/null)" = "$ip" ]; then
+		cmd_start "$ip" "$(cut -f2 "$STATE")"
+	fi
+}
+
+# av-delay <ip> [ms]: show or set the audio delay for an AirPlay TV. A running
+# cast re-reads the file within half a second, so no restart is needed.
+cmd_av_delay() {
+	local ip=$1 ms=${2:-}
+	if [ -z "$ms" ]; then echo "$(cat "$DELAY_DIR/$ip" 2>/dev/null || echo 0)"; return; fi
+	mkdir -p "$DELAY_DIR"; echo "$ms" > "$DELAY_DIR/$ip"
+}
+
+# av-delay-step <+/-ms>: nudge the delay of the TV being cast to.
+cmd_av_delay_step() {
+	local ip cur next
+	casting || { notify-send -t 1500 "Sound sync" "Not casting"; return; }
+	ip=$(cut -f1 "$STATE")
+	cur=$(cat "$DELAY_DIR/$ip" 2>/dev/null || echo 0)
+	next=$(( cur + $1 )); (( next < 0 )) && next=0; (( next > 2000 )) && next=2000
+	cmd_av_delay "$ip" "$next"
+	notify-send -t 2000 -h string:x-canonical-private-synchronous:raytube-sync "Sound sync: ${next} ms" \
+		"← sound earlier   → sound later   Enter/Esc done"
+}
+
+# resync: restart the current cast session. A fresh session always starts with
+# sound and picture in sync; the Apple TV never catches up by itself after a
+# glitch (doubletake can't FLUSH), so this is the recovery.
+cmd_resync() {
+	casting || { notify-send -t 1500 "Casting" "Not casting"; return; }
+	local ip name
+	ip=$(cut -f1 "$STATE"); name=$(cut -f2 "$STATE")
+	notify-send -t 3000 -h string:x-canonical-private-synchronous:raytube-sync "Casting" "Re-syncing $name (a few seconds of black)"
+	cmd_start "$ip" "$name"
+}
+
+case "${1:-}" in
+	resync) cmd_resync ;;
+	av-delay) cmd_av_delay "${2:?ip}" "${3:-}" ;;
+	size) cmd_size "${2:?ip}" "${3:-}" ;;
+	av-delay-step) cmd_av_delay_step "${2:?+/-ms}" ;;
+	list) cmd_list ;;
+	status) cmd_status ;;
+	start) [ $# -ge 2 ] || { echo "usage: $0 start <ip> [name]" >&2; exit 2; }; cmd_start "$2" "${3:-}" ;;
+	stop) cmd_stop ;;
+	release)
+		# End the cast but keep the TV desktop and its windows (e.g. while the
+		# receiver plays something natively).
+		systemctl --user stop "$UNIT" 2>/dev/null; rm -f "$STATE" ;;
+	mode) cmd_mode "${2:-}" ;;
+	tv)
+		if casting; then cmd_stop; exit 0; fi
+		IFS=$'\t' read -r ip name < "$LAST_FILE" 2>/dev/null || { notify-send "TV desktop" "Pick a TV once from the Display menu first."; exit 1; }
+		cmd_mode desktop >/dev/null
+		cmd_start "$ip" "$name"
+		notify-send "TV desktop" "Casting to $name. Command+Ctrl+Up sends a window there." ;;
+	toggle)
+		[ $# -ge 2 ] || { echo "usage: $0 toggle <ip> [name]" >&2; exit 2; }
+		if casting && [ "$(cut -f1 "$STATE" 2>/dev/null)" = "$2" ]; then cmd_stop; else cmd_start "$2" "${3:-}"; fi ;;
+	*) sed -n '2,/^set -u$/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 2 ;;
+esac

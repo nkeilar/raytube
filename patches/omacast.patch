@@ -1,0 +1,634 @@
+diff --git i/crates/core/src/cast/rtcp.rs w/crates/core/src/cast/rtcp.rs
+index 5ecaec2..74fc76b 100644
+--- i/crates/core/src/cast/rtcp.rs
++++ w/crates/core/src/cast/rtcp.rs
+@@ -84,6 +84,70 @@ pub enum RtcpEvent {
+     },
+     /// Receiver lost decoder state; needs a key frame.
+     PictureLoss,
++    /// Receiver event log entry (OFFER `receiverRtcpEventLog`): what the
++    /// receiver did with the frame whose RTP timestamp is `rtp_timestamp`.
++    /// For `Rendered`, `delay_ms` is how late (+) or early (-) it rendered
++    /// relative to its playout target.
++    FrameLog {
++        rtp_timestamp: u32,
++        kind: FrameLogKind,
++        delay_ms: i16,
++    },
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum FrameLogKind {
++    AckSent,
++    Decoded,
++    Rendered,
++    PacketReceived,
++}
++
++pub const RTCP_PT_APPLICATION_DEFINED: u8 = 204;
++/// APP subtype carrying receiver frame logs (openscreen RtcpSubtype::kReceiverLog).
++const APP_SUBTYPE_RECEIVER_LOG: u8 = 2;
++
++/// Wire event types, legacy audio/video and unified (openscreen
++/// statistics_common.h WireType).
++fn frame_log_kind(wire: u8) -> Option<FrameLogKind> {
++    match wire {
++        1 | 5 | 11 => Some(FrameLogKind::AckSent),
++        2 | 6 | 12 => Some(FrameLogKind::Rendered),
++        3 | 7 | 13 => Some(FrameLogKind::Decoded),
++        4 | 8 | 14 => Some(FrameLogKind::PacketReceived),
++        _ => None,
++    }
++}
++
++/// APP "CAST" receiver log body after the sender SSRC and name words:
++/// per frame [rtp ts u32][num_events-1 u8 | base time u24] then per event
++/// [delay-or-packet-id u16][type u4 | time delta u12]
++/// (openscreen compound_rtcp_parser.cc ParseFrameLogMessages).
++fn parse_receiver_log(mut body: &[u8], events: &mut Vec<RtcpEvent>) -> Result<(), RtcpError> {
++    while !body.is_empty() {
++        if body.len() < 8 {
++            return Err(RtcpError::Truncated);
++        }
++        let rtp_timestamp = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
++        let num_events = 1 + body[4] as usize;
++        body = &body[8..];
++        for _ in 0..num_events {
++            if body.len() < 4 {
++                return Err(RtcpError::Truncated);
++            }
++            let delay_or_packet = u16::from_be_bytes([body[0], body[1]]);
++            let wire = body[2] >> 4;
++            body = &body[4..];
++            if let Some(kind) = frame_log_kind(wire) {
++                events.push(RtcpEvent::FrameLog {
++                    rtp_timestamp,
++                    kind,
++                    delay_ms: delay_or_packet as i16,
++                });
++            }
++        }
++    }
++    Ok(())
+ }
+ 
+ pub const NACK_ALL_PACKETS: u16 = 0xFFFF;
+@@ -111,6 +175,16 @@ pub fn parse_compound(bytes: &[u8], media_ssrc: u32) -> Result<Vec<RtcpEvent>, R
+         let body = &rest[4..total_len];
+         rest = &rest[total_len..];
+ 
++        if packet_type == RTCP_PT_APPLICATION_DEFINED {
++            // [receiver ssrc][name]; the log is not addressed to a media SSRC.
++            if fmt == APP_SUBTYPE_RECEIVER_LOG
++                && body.len() >= 8
++                && u32::from_be_bytes([body[4], body[5], body[6], body[7]]) == CAST_WORD
++            {
++                parse_receiver_log(&body[8..], &mut events)?;
++            }
++            continue;
++        }
+         if packet_type != RTCP_PT_PAYLOAD_SPECIFIC {
+             continue; // RR / XR / SDES / BYE — nothing we act on yet
+         }
+@@ -240,6 +314,26 @@ mod tests {
+         assert_eq!(&bytes[24..28], &1234u32.to_be_bytes());
+     }
+ 
++    #[test]
++    fn parses_receiver_frame_log() {
++        // APP subtype 2 "CAST": one frame (rtp ts 0x1234) with two events:
++        // decoded (wire 13) and rendered (wire 12, 7 ms late).
++        let mut pkt = vec![0x80 | 2, 204, 0, 0];
++        pkt.extend_from_slice(&0xABCDu32.to_be_bytes()); // receiver ssrc
++        pkt.extend_from_slice(b"CAST");
++        pkt.extend_from_slice(&0x1234u32.to_be_bytes());
++        pkt.extend_from_slice(&[1, 0, 0, 10]); // 2 events, base time 10 ms
++        pkt.extend_from_slice(&[0, 0, 13 << 4, 1]);
++        pkt.extend_from_slice(&[0, 7, 12 << 4, 3]);
++        let words = pkt.len() / 4 - 1;
++        pkt[2..4].copy_from_slice(&(words as u16).to_be_bytes());
++        let events = parse_compound(&pkt, 0x1).unwrap();
++        assert_eq!(events, vec![
++            RtcpEvent::FrameLog { rtp_timestamp: 0x1234, kind: FrameLogKind::Decoded, delay_ms: 0 },
++            RtcpEvent::FrameLog { rtp_timestamp: 0x1234, kind: FrameLogKind::Rendered, delay_ms: 7 },
++        ]);
++    }
++
+     #[test]
+     fn parses_full_receiver_compound() {
+         let mut compound = receiver_report();
+diff --git i/crates/core/src/cast/sender.rs w/crates/core/src/cast/sender.rs
+index e657ce8..b85f369 100644
+--- i/crates/core/src/cast/sender.rs
++++ w/crates/core/src/cast/sender.rs
+@@ -26,7 +26,7 @@ pub const SENDER_REPORT_INTERVAL: Duration = Duration::from_millis(500);
+ pub const KICKSTART_INTERVAL: Duration = Duration::from_millis(250);
+ /// Frames in flight before we start shedding. Far below the 128-frame
+ /// ambiguity horizon of truncated 8-bit frame ids.
+-pub const DEFAULT_MAX_IN_FLIGHT_FRAMES: usize = 12;
++pub const DEFAULT_MAX_IN_FLIGHT_FRAMES: usize = 60; // openscreen allows 120 (kMaxUnackedFrames); receivers take ~0.5 s to send the first ACK
+ 
+ #[derive(Debug, Clone)]
+ pub struct StreamConfig {
+@@ -185,6 +185,15 @@ impl StreamSenderState {
+         match event {
+             RtcpEvent::Checkpoint { frame_id8, .. } => {
+                 let checkpoint = self.expand_frame_id(frame_id8);
++                // Before it has completed any frame the receiver reports its
++                // checkpoint as FrameId::leader() (-1, 0xFF on the wire), which
++                // expands past the newest frame sent. Like openscreen
++                // (sender_impl.cc), ignore checkpoints ahead of what we sent,
++                // or they release every buffered frame, including the opening
++                // key frame that a NACK in the same packet asks for.
++                if self.next_frame_id == 0 || checkpoint > self.next_frame_id - 1 {
++                    return Vec::new();
++                }
+                 while let Some(front) = self.buffer.front() {
+                     if front.frame_id <= checkpoint {
+                         self.buffer.pop_front();
+@@ -226,6 +235,8 @@ impl StreamSenderState {
+                 self.buffer.insert(idx, frame);
+                 packets
+             }
++            // Receiver telemetry only (logged by the task); nothing to resend.
++            RtcpEvent::FrameLog { .. } => Vec::new(),
+             RtcpEvent::PictureLoss => {
+                 tracing::debug!(ssrc = self.cfg.ssrc, "receiver reported picture loss");
+                 self.awaiting_key = true;
+@@ -344,6 +355,12 @@ async fn run_sender(
+ 
+     let mut recv_buf = vec![0u8; 4096];
+     let mut sent_any = false;
++    // Receiver feedback summary (INFO every 5 s): a self-check that frames are
++    // not just arriving but being decoded and rendered on the TV.
++    let video_ssrc = video.ssrc();
++    let mut telemetry = ReceiverTelemetry::default();
++    let mut audio_telemetry = ReceiverTelemetry::default();
++    let mut telemetry_logged = Instant::now();
+     let mut last_media_send = Instant::now();
+ 
+     loop {
+@@ -359,18 +376,19 @@ async fn run_sender(
+                         continue;
+                     };
+                     let packets = state.ingest(frame, Instant::now());
++                    if !sent_any && !packets.is_empty() {
++                        // Receivers need the NTP<->RTP mapping first: openscreen's
++                        // receiver drops packets that arrive before any Sender
++                        // Report, so send it ahead of the opening frame.
++                        sent_any = true;
++                        send_sender_reports(&socket, remote, &video, audio.as_ref()).await?;
++                    }
+                     for packet in &packets {
+                         socket.send_to(packet, remote).await.context("sending RTP")?;
+                     }
+                     if !packets.is_empty() {
+                         last_media_send = Instant::now();
+                     }
+-                    if !sent_any && !packets.is_empty() {
+-                        // Receivers need the NTP↔RTP mapping before they
+-                        // will render; don't wait for the first tick.
+-                        sent_any = true;
+-                        send_sender_reports(&socket, remote, &video, audio.as_ref()).await?;
+-                    }
+                 }
+                 None => {
+                     tracing::debug!("all sender handles dropped; media sender exiting");
+@@ -390,11 +408,29 @@ async fn run_sender(
+                     continue;
+                 }
+                 let datagram = &recv_buf[..n];
++                if telemetry_logged.elapsed() >= Duration::from_secs(5) {
++                    telemetry.log(telemetry_logged.elapsed());
++                    telemetry = ReceiverTelemetry::default();
++                    if audio.is_some() {
++                        tracing::info!(
++                            "receiver audio: checkpoints {}, nacks {}",
++                            audio_telemetry.checkpoints,
++                            audio_telemetry.nacks
++                        );
++                        audio_telemetry = ReceiverTelemetry::default();
++                    }
++                    telemetry_logged = Instant::now();
++                }
+                 for state in std::iter::once(&mut video).chain(audio.as_mut()) {
+                     match rtcp::parse_compound(datagram, state.ssrc()) {
+                         Ok(events) => {
+                             for event in events {
+                                 tracing::trace!(ssrc = state.ssrc(), ?event, "rtcp event");
++                                if state.ssrc() == video_ssrc {
++                                    telemetry.record(&event);
++                                } else {
++                                    audio_telemetry.record(&event);
++                                }
+                                 for packet in state.on_event(event) {
+                                     socket.send_to(&packet, remote).await.context("sending retransmit")?;
+                                 }
+@@ -450,6 +486,54 @@ async fn send_sender_reports(
+ 
+ // ---- tests ----
+ 
++/// Counts of receiver feedback for the video stream between summaries.
++#[derive(Default)]
++struct ReceiverTelemetry {
++    checkpoints: u32,
++    nacks: u32,
++    picture_losses: u32,
++    decoded: u32,
++    rendered: u32,
++    render_delay_sum_ms: i64,
++    render_delay_min_ms: Option<i16>,
++    render_delay_max_ms: Option<i16>,
++}
++
++impl ReceiverTelemetry {
++    fn record(&mut self, event: &RtcpEvent) {
++        match *event {
++            RtcpEvent::Checkpoint { .. } => self.checkpoints += 1,
++            RtcpEvent::Nack { .. } => self.nacks += 1,
++            RtcpEvent::PictureLoss => self.picture_losses += 1,
++            RtcpEvent::FrameLog { kind: rtcp::FrameLogKind::Decoded, .. } => self.decoded += 1,
++            RtcpEvent::FrameLog { kind: rtcp::FrameLogKind::Rendered, delay_ms, .. } => {
++                self.rendered += 1;
++                self.render_delay_sum_ms += delay_ms as i64;
++                self.render_delay_min_ms = Some(self.render_delay_min_ms.map_or(delay_ms, |m| m.min(delay_ms)));
++                self.render_delay_max_ms = Some(self.render_delay_max_ms.map_or(delay_ms, |m| m.max(delay_ms)));
++            }
++            RtcpEvent::FrameLog { .. } => {}
++        }
++    }
++
++    fn log(&self, window: Duration) {
++        let secs = window.as_secs_f64().max(0.001);
++        let avg = if self.rendered > 0 { self.render_delay_sum_ms / self.rendered as i64 } else { 0 };
++        tracing::info!(
++            "receiver: decoded {:.1} fps, rendered {:.1} fps (render delay avg {} ms, min {:?}, max {:?}), \
++             checkpoints {}, nacks {}, keyframe requests {}",
++            self.decoded as f64 / secs,
++            self.rendered as f64 / secs,
++            avg,
++            self.render_delay_min_ms,
++            self.render_delay_max_ms,
++            self.checkpoints,
++            self.nacks,
++            self.picture_losses,
++        );
++    }
++}
++
+ #[cfg(test)]
+ mod state_tests {
+     use super::*;
+@@ -540,6 +624,26 @@ mod state_tests {
+         assert!(!s.ingest(frame(true, 5), Instant::now()).is_empty());
+     }
+ 
++    #[test]
++    fn startup_leader_checkpoint_keeps_frames_for_retransmission() {
++        // Receiver has not completed frame 0 yet: checkpoint = leader (0xFF),
++        // plus a NACK for the whole of frame 0.
++        let mut s = StreamSenderState::new(config());
++        let sent = s.ingest(frame(true, 25), Instant::now());
++        assert!(sent.len() > 1);
++        s.on_event(RtcpEvent::Checkpoint {
++            frame_id8: 0xFF,
++            playout_delay_ms: 400,
++        });
++        assert_eq!(s.buffer.len(), 1, "leader checkpoint must not release frame 0");
++        let resent = s.on_event(RtcpEvent::Nack {
++            frame_id8: 0,
++            packet_id: 0xFFFF,
++            bitmask: 0,
++        });
++        assert_eq!(resent.len(), sent.len(), "whole frame 0 is retransmitted");
++    }
++
+     #[test]
+     fn checkpoint_releases_only_up_to_the_acked_frame() {
+         let mut s = StreamSenderState::new(config());
+diff --git i/crates/core/src/cast/streaming.rs w/crates/core/src/cast/streaming.rs
+index 9276c83..44a7ef0 100644
+--- i/crates/core/src/cast/streaming.rs
++++ w/crates/core/src/cast/streaming.rs
+@@ -77,10 +77,13 @@ impl StreamPlan {
+     pub fn new(quality: QualityParams, audio: bool) -> anyhow::Result<Self> {
+         let mut ssrc_bytes = [0u8; 8];
+         getrandom::getrandom(&mut ssrc_bytes).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+-        // Sender SSRCs are arbitrary but must be distinct; receiver replies
+-        // with ssrc+1 per openscreen convention.
+-        let video_ssrc = u32::from_le_bytes(ssrc_bytes[0..4].try_into().unwrap()) | 1;
+-        let audio_ssrc = video_ssrc.wrapping_add(2);
++        // Use openscreen's ranges (ssrc.cc): audio 1..=50000 (higher
++        // priority), video 50001..=100000. Arbitrary 32-bit SSRCs >= 2^31 make
++        // Chromecast firmware reject the OFFER ("Invalid or missing codec on
++        // first OFFER") -- about half of all sessions with random values.
++        let r = u32::from_le_bytes(ssrc_bytes[0..4].try_into().unwrap());
++        let video_ssrc = 50_001 + r % 50_000;
++        let audio_ssrc = 1 + (r / 50_000) % 50_000;
+         Ok(Self {
+             quality,
+             audio,
+@@ -127,7 +130,10 @@ impl StreamPlan {
+             "maxBitRate": q.video_bitrate_kbps * 1000,
+             "maxFrameRate": format!("{}000/1000", q.fps),
+             "resolutions": [{ "width": q.width, "height": q.height }],
+-            "receiverRtcpEventLog": false,
++            // Per-frame decoded/rendered feedback. Off by default: Chromecast
++            // with Google TV (HD) firmware 3.72 rejects such an OFFER with
++            // "Invalid or missing codec". OMACAST_RTCP_EVENT_LOG=1 enables it.
++            "receiverRtcpEventLog": std::env::var("OMACAST_RTCP_EVENT_LOG").is_ok_and(|v| v == "1"),
+         }));
+ 
+         json!({
+@@ -212,6 +218,15 @@ mod tests {
+         assert_eq!(offer["seqNum"], 7);
+     }
+ 
++    #[test]
++    fn ssrcs_use_openscreen_ranges() {
++        for _ in 0..200 {
++            let p = StreamPlan::new(QualityParams { width: 1920, height: 1080, fps: 30, video_bitrate_kbps: 6000, audio_bitrate_kbps: 128 }, true).unwrap();
++            assert!((50_001..=100_000).contains(&p.video_ssrc), "{}", p.video_ssrc);
++            assert!((1..=50_000).contains(&p.audio_ssrc), "{}", p.audio_ssrc);
++        }
++    }
++
+     #[test]
+     fn ssrcs_are_distinct() {
+         let p = plan();
+diff --git i/crates/core/src/config.rs w/crates/core/src/config.rs
+index 1e20f98..2bf2b0c 100644
+--- i/crates/core/src/config.rs
++++ w/crates/core/src/config.rs
+@@ -25,6 +25,11 @@ pub struct Config {
+     pub video_bitrate_kbps: Option<u32>,
+     /// How long `omacast devices` / auto-pick waits for mDNS answers.
+     pub discovery_timeout_ms: u64,
++    /// External video command (argv) that writes an H.264 Annex-B byte-stream
++    /// to stdout, replacing portal capture + the gst encoder. `{width}`,
++    /// `{height}`, `{fps}` and `{kbps}` are substituted from the same quality
++    /// parameters that go into the OFFER, so the two cannot disagree.
++    pub video_command: Option<Vec<String>>,
+ }
+ 
+ impl Default for Config {
+@@ -38,6 +43,7 @@ impl Default for Config {
+             framerate: None,
+             video_bitrate_kbps: None,
+             discovery_timeout_ms: 3_000,
++            video_command: None,
+         }
+     }
+ }
+diff --git i/crates/core/src/discovery.rs w/crates/core/src/discovery.rs
+index 284adef..e09d209 100644
+--- i/crates/core/src/discovery.rs
++++ w/crates/core/src/discovery.rs
+@@ -61,11 +61,23 @@ pub fn discover(timeout: Duration) -> Result<Vec<CastDevice>> {
+                     .find(|a| a.is_ipv4())
+                     .or_else(|| info.get_addresses().iter().next())
+                     .copied();
+-                if let Some(addr) = addr {
++                // mDNS answers arrive in pieces and each resolution replaces the
++                // entry: never let a later IPv6-only answer displace an IPv4
++                // address, and never use an IPv6 link-local address — connecting
++                // to it fails without an interface scope (EINVAL).
++                let usable = |a: &IpAddr| match a {
++                    IpAddr::V4(_) => true,
++                    IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
++                };
++                if let Some(addr) = addr.filter(usable) {
+                     if let Some(dev) =
+                         device_from_txt(&props, addr, info.get_port(), info.get_fullname())
+                     {
+-                        found.insert(dev.id.clone(), dev);
++                        let keep_existing = addr.is_ipv6()
++                            && found.get(&dev.id).is_some_and(|d| d.addr.is_ipv4());
++                        if !keep_existing {
++                            found.insert(dev.id.clone(), dev);
++                        }
+                     }
+                 }
+             }
+diff --git i/crates/daemon/src/pipeline.rs w/crates/daemon/src/pipeline.rs
+index e522b92..d56c120 100644
+--- i/crates/daemon/src/pipeline.rs
++++ w/crates/daemon/src/pipeline.rs
+@@ -86,12 +86,15 @@ pub fn detect_encoder(pref: EncoderPref) -> Result<Encoder> {
+     )
+ }
+ 
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum VideoSource {
+     /// PipeWire stream from the desktop portal.
+     Portal { pw_fd: i32, pw_node: u32 },
+     /// macOS AVFoundation screen capture; index 0 = main display.
+     MacScreen { device_index: u32 },
++    /// An external command (already-substituted argv) writing H.264 Annex-B
++    /// to stdout. gst then only carries audio.
++    Command(Vec<String>),
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -122,8 +125,9 @@ pub fn build_gst_args(p: &PipelineParams) -> Vec<String> {
+     let mut fragments: Vec<String> = vec!["-q".into()];
+ 
+     // Video branch → Annex-B access units on stdout.
+-    match p.source {
+-        VideoSource::Portal { pw_fd, pw_node } => {
++    match &p.source {
++        VideoSource::Command(_) => {}
++        &VideoSource::Portal { pw_fd, pw_node } => {
+             // min-buffers: xdg-desktop-portal-hyprland drops the frame and
+             // renegotiates the whole stream ("Out of buffers → Retrying
+             // screencopy") whenever no free buffer is queued, and gst's
+@@ -149,7 +153,7 @@ pub fn build_gst_args(p: &PipelineParams) -> Vec<String> {
+             fragments.push("!".into());
+             fragments.push(format!("video/x-raw,width={},height={}", q.width, q.height));
+         }
+-        VideoSource::MacScreen { device_index } => {
++        &VideoSource::MacScreen { device_index } => {
+             fragments.push(format!(
+                 "avfvideosrc capture-screen=true capture-screen-cursor=true device-index={device_index} do-timestamp=true"
+             ));
+@@ -162,14 +166,16 @@ pub fn build_gst_args(p: &PipelineParams) -> Vec<String> {
+             ));
+         }
+     }
+-    fragments.push("!".into());
+-    fragments.push(encoder_fragment(p.encoder, q.video_bitrate_kbps, q.fps));
+-    fragments.push("!".into());
+-    fragments.push("h264parse config-interval=-1".into());
+-    fragments.push("!".into());
+-    fragments.push("video/x-h264,stream-format=byte-stream,alignment=au".into());
+-    fragments.push("!".into());
+-    fragments.push("fdsink fd=1".into());
++    if !matches!(p.source, VideoSource::Command(_)) {
++        fragments.push("!".into());
++        fragments.push(encoder_fragment(p.encoder, q.video_bitrate_kbps, q.fps));
++        fragments.push("!".into());
++        fragments.push("h264parse config-interval=-1".into());
++        fragments.push("!".into());
++        fragments.push("video/x-h264,stream-format=byte-stream,alignment=au".into());
++        fragments.push("!".into());
++        fragments.push("fdsink fd=1".into());
++    }
+ 
+     // Audio branch → Opus/RTP to the daemon's loopback port.
+     if let Some(a) = &p.audio {
+@@ -224,6 +230,13 @@ fn encoder_fragment(enc: Encoder, bitrate_kbps: u32, fps: u32) -> String {
+ 
+ /// Resolve the default sink's monitor source for system-audio capture (F6).
+ pub fn default_sink_monitor() -> Option<String> {
++    // OMACAST_AUDIO_MONITOR picks another source, e.g. a dedicated "TV" sink's
++    // monitor so only audio routed there is cast.
++    if let Ok(dev) = std::env::var("OMACAST_AUDIO_MONITOR") {
++        if !dev.is_empty() {
++            return Some(dev);
++        }
++    }
+     let out = std::process::Command::new("pactl")
+         .args(["get-default-sink"])
+         .output()
+@@ -237,6 +250,9 @@ pub fn default_sink_monitor() -> Option<String> {
+ 
+ /// Spawn gst-launch with stdout piped (the video byte-stream).
+ pub fn spawn(p: &PipelineParams) -> Result<tokio::process::Child> {
++    if let VideoSource::Command(argv) = &p.source {
++        return spawn_command(argv, p.audio.is_some().then(|| build_gst_args(p)));
++    }
+     let args = build_gst_args(p);
+     tracing::debug!("spawning: gst-launch-1.0 {}", args.join(" "));
+     tokio::process::Command::new("gst-launch-1.0")
+@@ -249,6 +265,33 @@ pub fn spawn(p: &PipelineParams) -> Result<tokio::process::Child> {
+         .context("spawning gst-launch-1.0 — is gstreamer installed?")
+ }
+ 
++/// Run an external video command (stdout = video), with an optional audio-only
++/// gst-launch alongside it. The shell execs into the video command so killing
++/// the child kills the video process; gst gets a parent-death SIGKILL so it
++/// never outlives it.
++fn spawn_command(video: &[String], audio_gst: Option<Vec<String>>) -> Result<tokio::process::Child> {
++    anyhow::ensure!(!video.is_empty(), "video_command is empty");
++    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
++    let mut script = String::new();
++    if let Some(args) = audio_gst {
++        script.push_str("setpriv --pdeathsig KILL gst-launch-1.0 ");
++        script.push_str(&args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" "));
++        script.push_str(" >/dev/null & ");
++    }
++    script.push_str("exec ");
++    script.push_str(&video.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" "));
++    tracing::debug!("spawning: bash -c {script}");
++    tokio::process::Command::new("bash")
++        .arg("-c")
++        .arg(&script)
++        .stdin(std::process::Stdio::null())
++        .stdout(std::process::Stdio::piped())
++        .stderr(gst_stderr())
++        .kill_on_drop(true)
++        .spawn()
++        .context("spawning video_command")
++}
++
+ /// gst warnings go to the terminal in dev; headless (menu bar app, service)
+ /// they land in a log file so black-screen debugging has somewhere to look.
+ fn gst_stderr() -> std::process::Stdio {
+@@ -342,6 +385,15 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn command_source_leaves_only_audio_in_gst() {
++        let cmd = build_gst_args(&params(VideoSource::Command(vec!["wf-recorder".into()]), true)).join(" ");
++        assert!(cmd.contains("pulsesrc"), "{cmd}");
++        assert!(cmd.contains("udpsink"), "{cmd}");
++        assert!(!cmd.contains("fdsink"), "{cmd}");
++        assert!(!cmd.contains("h264parse"), "{cmd}");
++    }
++
+     #[test]
+     fn mac_screen_flows_to_stdout_as_annexb() {
+         let cmd = build_gst_args(&params(VideoSource::MacScreen { device_index: 1 }, false)).join(" ");
+diff --git i/crates/daemon/src/session.rs w/crates/daemon/src/session.rs
+index 02ba000..14df6b3 100644
+--- i/crates/daemon/src/session.rs
++++ w/crates/daemon/src/session.rs
+@@ -31,7 +31,17 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+ const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+ const STALE_APP_TIMEOUT: Duration = Duration::from_secs(5);
+-const APP_SETTLE_DELAY: Duration = Duration::from_millis(300);
++/// Wait between the app reporting launched and sending the OFFER, multiplied
++/// by the attempt number. OMACAST_SETTLE_MS overrides the base.
++fn app_settle_delay() -> Duration {
++    let ms = std::env::var("OMACAST_SETTLE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
++    Duration::from_millis(ms)
++}
++
++/// OFFER attempts before giving up (each relaunches the app). OMACAST_OFFER_ATTEMPTS overrides.
++fn offer_attempts() -> u32 {
++    std::env::var("OMACAST_OFFER_ATTEMPTS").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
++}
+ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+ const HEARTBEAT_LOSS: Duration = Duration::from_secs(20);
+ 
+@@ -342,7 +352,8 @@ impl Session {
+                 .await?;
+             let (transport_id, session_id) =
+                 wait_for_app(&mut writer, &mut msg_rx, LAUNCH_TIMEOUT).await?;
+-            tokio::time::sleep(APP_SETTLE_DELAY).await;
++            // Settle before the OFFER, backing off per attempt.
++            tokio::time::sleep(app_settle_delay() * attempt).await;
+             writer
+                 .send_json(&transport_id, NS_CONNECTION, &messages::connect_payload())
+                 .await?;
+@@ -360,7 +371,7 @@ impl Session {
+                             .send_json(RECEIVER_ID, NS_RECEIVER, &messages::stop_payload(5, sid))
+                             .await;
+                     }
+-                    if attempt >= 2 {
++                    if attempt >= offer_attempts() {
+                         return Err(err);
+                     }
+                     tracing::warn!("OFFER attempt {attempt} failed ({err}); relaunching the app");
+@@ -430,8 +441,21 @@ impl Session {
+         udp_port: u16,
+         audio_source: Option<pipeline::AudioSource>,
+     ) -> Result<Media> {
+-        // Capture: portal (Linux) or AVFoundation (macOS).
+-        let (source, capture) = if cfg!(target_os = "macos") {
++        // Capture: an external video command, the portal (Linux) or
++        // AVFoundation (macOS).
++        let (source, capture) = if let Some(argv) = &self.config.video_command {
++            let q = &plan.quality;
++            let argv = argv
++                .iter()
++                .map(|a| {
++                    a.replace("{width}", &q.width.to_string())
++                        .replace("{height}", &q.height.to_string())
++                        .replace("{fps}", &q.fps.to_string())
++                        .replace("{kbps}", &q.video_bitrate_kbps.to_string())
++                })
++                .collect();
++            (pipeline::VideoSource::Command(argv), None)
++        } else if cfg!(target_os = "macos") {
+             if !matches!(self.opts.mode, CaptureMode::Output) {
+                 tracing::warn!(
+                     "window/region capture is a portal concept; capturing the full screen on macOS"
+@@ -455,8 +479,12 @@ impl Session {
+                 Some(cap),
+             )
+         };
+-        let encoder =
+-            pipeline::detect_encoder(self.config.encoder).context("selecting an encoder")?;
++        // An external video command brings its own encoder.
++        let encoder = if matches!(source, pipeline::VideoSource::Command(_)) {
++            pipeline::Encoder::X264
++        } else {
++            pipeline::detect_encoder(self.config.encoder).context("selecting an encoder")?
++        };
+ 
+         // The media socket + RTP/RTCP task.
+         let (handle, sender_task) = spawn_sender(SenderConfig {
