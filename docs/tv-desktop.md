@@ -190,6 +190,13 @@ did this to a private window on 2026-09-26).
 
 ## Display menu (nathank.monitor)
 
+**Cast menu plugin (2026-09-27):** the cast and TV-desktop controls below now also ship as a
+standalone Omarchy plugin, `nathank.raytube` (repo `../omarchy-raytube`, MIT; installed here with
+`omarchy plugin add file://…`). It shows "raytube tools not installed" when `raytube-cast` isn't on
+PATH and "Looking for TVs…" while discovering. The Display-panel clone below still carries the same
+controls on this machine until the author retires it (two cast icons in the bar meanwhile).
+
+
 CAST section: **Screen | TV desktop** chips (switching mid-cast restarts the
 cast in the new mode), receiver list with casting state. TV DESKTOP section
 (only while `TV` exists): Full / Split / PiP / rotation, Board / Browser /

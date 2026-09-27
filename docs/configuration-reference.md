@@ -6,6 +6,21 @@ thermal guard's thresholds, and the switches added to the three patched programs
 are what runs today. For files on disk (config and state paths) see
 [project_architecture.md](architecture.md#configuration-and-state-the-schema).
 
+## GPU detection and program lookup (`scripts/detect-gpu.sh`, `lib/raytube-env.sh`)
+
+Every launcher sources `lib/raytube-env.sh`, which loads `~/.config/raytube/gpu.env` (written by
+`scripts/detect-gpu.sh`, run by `install.sh` or on first use) and finds the patched programs.
+
+| Variable | How it's set | What it does |
+|---|---|---|
+| `RAYTUBE_RENDER_NODE` | first `i915`/`xe` render node | VA-API device for encoding (this laptop: `/dev/dri/renderD129`) |
+| `WF_FORCE_DMABUF` | 1 when the encode GPU isn't the one driving the display | zero-copy capture across GPUs |
+| `WF_IMPLICIT_MODIFIER` | 1 when the display GPU is AMD GCN 1.0 (Southern Islands PCI IDs) | implicit-modifier buffers (this laptop's R9 M370X) |
+| `RAYTUBE_GPU_ENV` | default `~/.config/raytube/gpu.env` | where the detection result lives |
+| `WF_RECORDER_BIN`, `DOUBLETAKE_BIN`, `OMACAST_BIN`, `OMACASTD_BIN` | override, else `build/bin/`, else `project-references/` clones, else PATH | the patched programs |
+| `TARGET` | required by `cast-tv.sh` (no built-in default) | the Apple TV's IP; `raytube-cast` sets it |
+| `RAYTUBE_LAPTOP_OUTPUT` | unset → first non-TV monitor | where windows come home to |
+
 ## Receiver discovery and pairing
 
 `raytube-cast list` asks Avahi for `_airplay._tcp` and `_googlecast._tcp` services and prints
