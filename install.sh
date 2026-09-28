@@ -82,7 +82,7 @@ if [ ! -f "$ROOT/board/data.js" ]; then
 fi
 
 say "5. The Cast menu (Omarchy plugin)"
-echo "  omarchy plugin add https://github.com/<owner>/omarchy-raytube --enable"
+echo "  omarchy plugin add https://github.com/nkeilar/omarchy-raytube --enable"
 [ -d "$ROOT/../omarchy-raytube/.git" ] && echo "  (local checkout: omarchy plugin add file://$(cd "$ROOT/../omarchy-raytube" && pwd) --enable)"
 
 say "6. Steps that need root (run them yourself)"

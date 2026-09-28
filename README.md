@@ -22,10 +22,10 @@ Requirements: Omarchy 4 (Hyprland with the Lua config), an **Intel GPU** for H.2
 (VA-API), and PipeWire. AMD- or NVIDIA-only machines are not supported yet.
 
 ```bash
-git clone https://github.com/<owner>/raytube && cd raytube
+git clone https://github.com/nkeilar/raytube && cd raytube
 ./install.sh --dry-run        # see what it will do
 ./install.sh --write-hypr     # build the patched senders, link the tools, load the keys
-omarchy plugin add https://github.com/<owner>/omarchy-raytube --enable   # the Cast menu
+omarchy plugin add https://github.com/nkeilar/omarchy-raytube --enable   # the Cast menu
 ```
 
 `install.sh` never needs root; it prints the optional root steps (fan and turbo control for the
