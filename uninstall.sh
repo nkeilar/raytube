@@ -15,6 +15,7 @@ DRY=0 PURGE=0
 for a in "$@"; do
 	case "$a" in --dry-run) DRY=1 ;; --purge) PURGE=1 ;; *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 done
+drop_require() { cp -- "$1" "$1.bak.uninstall" && sed -i '/-- raytube: TV desktop keys and monitor rule/d; /require("hypr.raytube")/d' -- "$1"; }
 do_() { local what=$1; shift; if (( DRY )); then echo "  would: $what"; else echo "  $what"; "$@"; fi; }
 
 do_ "stop any cast" "$ROOT/raytube-cast" stop
@@ -29,7 +30,7 @@ done
 HYPR="$HOME/.config/hypr/hyprland.lua"
 if grep -q 'require("hypr.raytube")' "$HYPR" 2>/dev/null; then
 	do_ "remove the raytube lines from hyprland.lua (backup: hyprland.lua.bak.uninstall)" \
-		sh -c "cp '$HYPR' '$HYPR.bak.uninstall' && sed -i '/-- raytube: TV desktop keys and monitor rule/d; /require(\"hypr.raytube\")/d' '$HYPR'"
+		drop_require "$HYPR"
 fi
 omarchy plugin list 2>/dev/null | grep -q '^nathank.raytube ' && do_ "remove the Cast menu plugin" omarchy plugin remove nathank.raytube --yes
 if (( PURGE )); then

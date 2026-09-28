@@ -73,6 +73,7 @@ Example: `FPS=24 BITRATE=12000 LATENCY_MS=150 ./cast-tv.sh`.
 | `HOLD_S` | `30` | Minimum seconds the cap stays on |
 | `INTERVAL` | `2` | Seconds between temperature samples |
 | `FAN_MODE` | `quiet` | `quiet`: our own fan curve (the Mac runs these fans flat out from ~67°C); `auto`: SMC control, boost when hot; `max`: maximum for the whole run |
+| `CAST_GUARD_SUDO` | `0` | `1` = if the `raytube` group can't write a control yet, try `sudo -n` (opt-in; needs passwordless sudo), e.g. `systemctl --user set-environment CAST_GUARD_SUDO=1` until your next login |
 | `TURBO` | `0` | `0` turns Intel turbo boost off for the cast (`intel_pstate/no_turbo`, restored on exit); `1` keeps it |
 | `QUIET_RPM` | `3500` | Quiet curve speed up to `QUIET_FROM_C` |
 | `QUIET_FROM_C` | `70` | Curve rises linearly above this… |

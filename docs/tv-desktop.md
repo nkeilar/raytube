@@ -103,7 +103,7 @@ membership. The menu shows a countdown.
 window (profile `~/.local/share/raytube/board-chromium`, audio to the TV
 sink) and places it in the `board` scene. Chromium ignores `--class` in
 `--app` mode: the window class is URL-based
-(`chrome-__home_nathank_workspace_raytube_board_index.html-Default`), matched by
+(`chrome-__home_<user>_workspace_raytube_board_index.html-Default`), matched by
 `is_board()`.
 
 The page is drawn for 1920x1080: live clock, weather line, one column per

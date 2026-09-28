@@ -40,6 +40,7 @@ normal Omarchy tiling, or apply a preset:
                                playing onto the TV desktop, at the same position
 """
 import json
+import re
 import os
 import subprocess
 import sys
@@ -155,6 +156,9 @@ def tv_position():
 # ---------- commands ----------
 
 def cmd_up(size="1920x1080"):
+    # Goes into a Hyprland Lua command: digits only.
+    if not re.fullmatch(r"[1-9][0-9]{2,4}x[1-9][0-9]{2,4}", size):
+        sys.exit(f"size must be WxH, e.g. 1920x1080 (got {size!r})")
     if not tv_monitor():
         subprocess.run(["hyprctl", "-q", "output", "create", "headless", OUT])
         time.sleep(0.3)
@@ -552,7 +556,7 @@ user_pref("browser.sessionstore.resume_from_crash", false);
 
 
 def media(*args):
-    out = subprocess.run(["uv", "run", "--quiet", "--with", "pychromecast", "--with", "websockets",
+    out = subprocess.run(["uv", "run", "--quiet", "--locked", "--script",
                           os.path.join(HERE, "raytube-media.py"), *args],
                          capture_output=True, text=True, timeout=90)
     if out.returncode != 0:
@@ -768,6 +772,8 @@ def main(argv):
     elif cmd == "json":
         cmd_json()
     elif cmd == "scene" and args:
+        if args[0] not in [s["id"] for s in load_config()["scenes"]]:
+            sys.exit(f"no scene {args[0]!r}")
         show_scene(args[0])
     elif cmd in ("next", "prev"):
         if not tv_monitor():
@@ -793,7 +799,7 @@ def main(argv):
         cmd_native()
     elif cmd == "pull":
         cmd_pull()
-    elif cmd == "rotate-scene" and len(args) == 2:
+    elif cmd == "rotate-scene" and len(args) == 2 and args[1] in ("on", "off"):
         cmd_rotate_scene(args[0], args[1])
     else:
         print(__doc__.strip())

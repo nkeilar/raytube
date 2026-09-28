@@ -115,8 +115,8 @@ Firefox and Omarchy-menu examples), `board/` with `data.example.js`, `patches/`,
 `project-references/`, template leftovers, backups. The Cast menu is a separate plugin repo,
 `../omarchy-raytube` (id `nathank.raytube`). This machine loads the keys and TV rule with
 `require("hypr.raytube")` in `hyprland.lua` (`~/.config/hypr/raytube.lua` → `config/hypr/raytube.lua`).
-Fan/turbo control: `raytube` group + `/etc/tmpfiles.d/raytube-hw.conf` (applied here 2026-09-27;
-takes effect after a re-login; the blanket NOPASSWD sudoers entry is still present).
+Fan/turbo control: `raytube` group + `/etc/tmpfiles.d/raytube-hw.conf` (takes effect after a
+re-login; until then `CAST_GUARD_SUDO=1` lets the guard fall back to passwordless sudo, opt-in).
 
 ## Related docs
 

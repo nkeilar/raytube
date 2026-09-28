@@ -66,7 +66,8 @@ if grep -q 'require("hypr.raytube")' "$HYPR" 2>/dev/null; then
 	echo "  hyprland.lua already loads raytube"
 elif (( WRITE_HYPR )); then
 	do_ "back up hyprland.lua to hyprland.lua.bak.raytube" cp "$HYPR" "$HYPR.bak.raytube"
-	do_ "add require(\"hypr.raytube\") to hyprland.lua" sh -c "printf '\n-- raytube: TV desktop keys and monitor rule\nrequire(\"hypr.raytube\")\n' >> '$HYPR'"
+	add_require() { printf '\n-- raytube: TV desktop keys and monitor rule\nrequire("hypr.raytube")\n' >> "$1"; }
+	do_ "add require(\"hypr.raytube\") to hyprland.lua" add_require "$HYPR"
 else
 	echo "  add this line at the end of ~/.config/hypr/hyprland.lua (or rerun with --write-hypr):"
 	echo '      require("hypr.raytube")'
@@ -75,7 +76,10 @@ OMACAST="$HOME/.config/omacast/config.toml"
 if [ -f "$OMACAST" ]; then
 	echo "  keeping your ~/.config/omacast/config.toml; make sure video_command points at $ROOT/wf-capture.sh"
 else
-	do_ "write ~/.config/omacast/config.toml" sh -c "mkdir -p '$HOME/.config/omacast' && sed 's|@RAYTUBE_DIR@|$ROOT|' '$ROOT/config/omacast/config.toml.in' > '$OMACAST'"
+	write_omacast() { # <template> <raytube dir> <out>: the dir is substituted literally (no sed)
+		mkdir -p "$(dirname "$3")" && python3 -c 'import sys; t, d, o = sys.argv[1:]; open(o, "w").write(open(t).read().replace("@RAYTUBE_DIR@", d.replace("\\", "\\\\").replace(chr(34), "\\" + chr(34))))' "$1" "$2" "$3"
+	}
+	do_ "write ~/.config/omacast/config.toml" write_omacast "$ROOT/config/omacast/config.toml.in" "$ROOT" "$OMACAST"
 fi
 if [ ! -f "$ROOT/board/data.js" ]; then
 	do_ "copy board/data.example.js to board/data.js (edit it for your family)" cp "$ROOT/board/data.example.js" "$ROOT/board/data.js"

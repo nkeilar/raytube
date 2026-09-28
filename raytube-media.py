@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pychromecast==14.0.10", "websockets==17.1"]
+# ///
 """raytube-media.py -- talk to the TV browser and to a Chromecast's own apps.
-Run through uv so its libraries stay out of the system:
+Run through uv so its libraries stay out of the system, at the versions pinned
+above and locked (with everything they pull in) in raytube-media.py.lock:
 
-  uv run --quiet --with pychromecast --with websockets raytube-media.py <command>
+  uv run --quiet --locked --script raytube-media.py <command>
 
 TV browser (a Firefox instance started with --remote-debugging-port, spoken to
 over WebDriver BiDi):

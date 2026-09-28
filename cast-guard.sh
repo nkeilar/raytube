@@ -55,12 +55,13 @@ GPU_T=$(hwmon 'amdgpu|radeon|nouveau')
 mkdir -p "$(dirname "$LOG")"
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG" >&2; }
 # Write a sysfs control: directly when the raytube group may (config/tmpfiles),
-# else via passwordless sudo if available, else skip (warned once per file).
+# else skip (warned once per file). CAST_GUARD_SUDO=1 also tries passwordless
+# sudo (opt-in, e.g. before logging in again after joining the raytube group).
 declare -A warned=()
 put() {
 	[ -n "$1" ] && [ -e "$1" ] || return 0
 	if [ -w "$1" ]; then echo "$2" > "$1" 2>/dev/null && return 0; fi
-	echo "$2" | sudo -n tee "$1" >/dev/null 2>&1 && return 0
+	[ "${CAST_GUARD_SUDO:-0}" = 1 ] && echo "$2" | sudo -n tee "$1" >/dev/null 2>&1 && return 0
 	[ -n "${warned[$1]:-}" ] || { warned[$1]=1; log "WARN: no permission to write $1 (see config/tmpfiles/raytube-hw.conf)"; }
 }
 
