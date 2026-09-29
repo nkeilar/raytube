@@ -104,7 +104,8 @@ omacast's `video_command`, called as `wf-capture.sh {width} {height} {fps} {kbps
 values taken from the same quality settings as the OFFER.
 
 - **`RAYTUBE_OUTPUT`**: the monitor to capture. `raytube-cast` sets it to `TV` in desktop
-  mode; unset means the laptop screen.
+  mode and to the mirrored screen in Screen mode; fit/pad is skipped only for `TV`.
+- **`RAYTUBE_MIRROR_OUTPUT`**: the screen Screen (mirror) mode records. Default: the focused screen, never the `TV` desktop. `raytube-cast` passes it as `RAYTUBE_OUTPUT` / `-o` because wf-recorder asks which output to record (and exits) when there are two or more.
 - **Encoder settings**: `h264_vaapi` on `/dev/dri/renderD129`, VBR at `{kbps}` with the same
   maxrate, GOP `g=15` (a keyframe every 0.5 s at 30 fps, so receivers recover quickly from
   loss), no B-frames, access-unit delimiters, `async_depth=1`.

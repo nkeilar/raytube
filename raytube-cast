@@ -36,22 +36,26 @@ DELAY_DIR="$HOME/.config/raytube/av-delay"
 CREDS="$HOME/.config/doubletake/credentials.json"
 
 # AirPlay receivers on the LAN: name, IPv4 address, AirPlay device id.
+# mDNS names come with decimal escapes (\\032 space, \\091 "[", UTF-8 bytes):
+# decode them byte by byte (LC_ALL=C), so "[LG] webOS TV" shows as it should.
 receivers() {
-	avahi-browse -rpt _airplay._tcp 2>/dev/null | awk -F';' '
+	avahi-browse -rpt _airplay._tcp 2>/dev/null | LC_ALL=C awk -F';' '
+		function unesc(s,  o) { o = ""; while (match(s, /\\[0-9][0-9][0-9]/)) { o = o substr(s, 1, RSTART - 1) sprintf("%c", substr(s, RSTART + 1, 3) + 0); s = substr(s, RSTART + 4) } return o s }
 		$1 == "=" && $3 == "IPv4" {
 			id = ""
 			if (match($0, /"deviceid=[^"]*"/)) id = substr($0, RSTART + 10, RLENGTH - 11)
-			name = $4; gsub(/\\032/, " ", name)
+			name = unesc($4)
 			print name "\t" $8 "\t" id
 		}' | sort -u
 }
 
 # Chromecasts: friendly name (TXT fn=, what omacast --to matches), IPv4.
 cast_receivers() {
-	avahi-browse -rpt _googlecast._tcp 2>/dev/null | awk -F';' '
+	avahi-browse -rpt _googlecast._tcp 2>/dev/null | LC_ALL=C awk -F';' '
+		function unesc(s,  o) { o = ""; while (match(s, /\\[0-9][0-9][0-9]/)) { o = o substr(s, 1, RSTART - 1) sprintf("%c", substr(s, RSTART + 1, 3) + 0); s = substr(s, RSTART + 4) } return o s }
 		$1 == "=" && $3 == "IPv4" {
 			name = ""
-			if (match($0, /"fn=[^"]*"/)) name = substr($0, RSTART + 4, RLENGTH - 5)
+			if (match($0, /"fn=[^"]*"/)) name = unesc(substr($0, RSTART + 4, RLENGTH - 5))
 			if (name != "") print name "\t" $8
 		}' | sort -u
 }
@@ -124,6 +128,15 @@ cmd_stop() {
 	"$DIR/raytube-tv" down
 }
 
+# The screen to mirror: RAYTUBE_MIRROR_OUTPUT, else the focused one, else the
+# first; never the TV desktop.
+mirror_output() {
+	[ -n "${RAYTUBE_MIRROR_OUTPUT:-}" ] && { echo "$RAYTUBE_MIRROR_OUTPUT"; return; }
+	hyprctl monitors -j 2>/dev/null | python3 -c 'import json, sys
+m = [x for x in json.load(sys.stdin) if x["name"] != "TV"]
+print(next((x["name"] for x in m if x["focused"]), m[0]["name"] if m else ""))'
+}
+
 cmd_start() {
 	local ip=$1 name=${2:-$1} id kind
 	name=$(printf '%s' "$name" | tr -d '\t\n\r' | cut -c1-80)
@@ -149,9 +162,12 @@ cmd_start() {
 			--setenv=PULSE_PROPS="device=raytube_tv.monitor buffer-time=60000 latency-time=20000")
 	else
 		"$DIR/raytube-tv" down
-		# Mirror mode: the laptop screen, fitted and padded to the chosen size.
+		# Mirror mode: one screen, fitted and padded to the chosen size. Name it:
+		# with two or more outputs wf-recorder asks which to record, and exits.
 		# The old 3200x1800 canvas made the Apple TV hold the picture back too.
-		[ "$kind" = airplay ] && env=(--setenv=CANVAS="$(airplay_size "$ip")")
+		local out; out=$(mirror_output)
+		[[ "$out" =~ ^[A-Za-z0-9._-]+$ ]] && env=(--setenv=RAYTUBE_OUTPUT="$out" --setenv=WF_ARGS="-D -o $out")
+		[ "$kind" = airplay ] && env+=(--setenv=CANVAS="$(airplay_size "$ip")")
 	fi
 	if [ "$kind" = cast ]; then
 		printf '%s\t%s\n' "$ip" "$name" > "$STATE"

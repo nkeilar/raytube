@@ -13,7 +13,7 @@ OUTPUT_ARGS=()
 # The TV desktop is created at exactly the cast size, so there both passes are
 # full-frame copies that do nothing: convert only.
 FILTER="scale_vaapi=w=$W:h=$H:force_original_aspect_ratio=decrease:force_divisible_by=2,pad_vaapi=w=$W:h=$H:x=-1:y=-1:color=black,scale_vaapi=format=nv12"
-if [ -n "${RAYTUBE_OUTPUT:-}" ] && [ "$(cat "$HOME/.local/state/raytube/tv-size" 2>/dev/null)" = "${W}x${H}" ]; then
+if [ "${RAYTUBE_OUTPUT:-}" = TV ] && [ "$(cat "$HOME/.local/state/raytube/tv-size" 2>/dev/null)" = "${W}x${H}" ]; then
 	FILTER="scale_vaapi=format=nv12"
 fi
 

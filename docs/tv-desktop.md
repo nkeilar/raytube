@@ -136,7 +136,7 @@ The sample uses relative days so it always looks current. Preview without the TV
 - **Decode caveat (2026-09-27):** a YouTube livestream replay was seen decoding in
   **software** (`av:h264` threads, ~56% of a core) despite the hardware-decode setup.
   Cause not known yet.
-- `raytube-media.py` (run via `uv run --with pychromecast --with websockets`)
+- `raytube-media.py` (run via `uv run --quiet --locked --script`)
   talks WebDriver BiDi to that browser (`tv-video`, `tv-pause`, `tv-open`,
   `tv-fullscreen`) and
   pychromecast to the Chromecast (`cc-status`, `cc-youtube`, `cc-quit`).
